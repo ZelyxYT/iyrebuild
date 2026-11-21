@@ -2221,8 +2221,9 @@ function dragGUI(gui)
 		local startPos
 		local function update(input)
 			local delta = input.Position - dragStart
-			local Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-			TweenService:Create(gui, TweenInfo.new(.20), {Position = Position}):Play()
+			local position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			-- Dragging shouldn't allocate a fresh Tween object per mouse event.
+			gui.Position = position
 		end
 		gui.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -3098,12 +3099,12 @@ function saves()
 					if vtype(json.eventBinds, "string") then loadedEventData = json.eventBinds end
 				end)
 				if not success then
+					-- Preserve the original file for manual recovery; do not wipe it.
 					jsonAttempts = jsonAttempts + 1
-					warn("Save Json Error:", response)
-					warn("Overwriting Save File")
-					writefile("IY_FE.iy", defaults, true)
-					wait()
-					saves()
+					warn("Save Json Error (original file preserved):", response)
+					nosaves = true
+					useFactorySettings()
+					createPopup("Settings Recovery", "Your IY_FE.iy file could not be read. The original was NOT overwritten. Infinite Yield is using temporary default settings for this session. Repair or back up the file before saving again.")
 				end
 			else
 				writefile("IY_FE.iy", defaults, true)
@@ -5163,100 +5164,254 @@ end
 -- NOVA v2 dispatcher: bounded chains, tracked infinite loops, isolated errors,
 -- no busy spins, and deterministic history entries. Existing signatures kept.
 local novaInfiniteLoops = {}
-_G.IY_NOVA_DISPATCH = {infinite = novaInfiniteLoops, executed = 0, blocked = 0}
-local function novaWords(command)
-    local parts = {}
-    for word in tostring(command):gmatch("%S+") do parts[#parts + 1] = word end
-    return parts
+local novaDispatch = {
+    infinite = novaInfiniteLoops, executed = 0, blocked = 0,
+    active = 0, maxActive = 10, maxLoops = 10,
+    launched = 0, completed = 0, failures = 0, cancelled = 0,
+    generation = 0, maxBatchCalls = 1600, budgetStops = 0,
+    startedAt = os.clock()
+}
+_G.IY_NOVA_DISPATCH = novaDispatch
+
+-- Quoted arguments preserve names such as: novabeacon "Golden Orb".
+-- Escaped quotes are supported inside quoted text.
+local function novaWords(raw)
+    local words, current, quoted, occupied = {}, {}, nil, false
+    local i, n = 1, #raw
+    while i <= n do
+        local ch = raw:sub(i, i)
+        if quoted then
+            if ch == quoted then
+                quoted = nil
+            elseif ch == "\\" and raw:sub(i + 1, i + 1) == quoted then
+                i = i + 1
+                current[#current + 1] = raw:sub(i, i)
+            else
+                current[#current + 1] = ch
+            end
+        elseif (ch == '"' or ch == "'") and not occupied then
+            quoted = ch
+            occupied = true
+        elseif ch:match("%s") then
+            if occupied then
+                words[#words + 1] = table.concat(current)
+                current, occupied = {}, false
+            end
+        else
+            current[#current + 1] = ch
+            occupied = true
+        end
+        i = i + 1
+    end
+    if occupied then words[#words + 1] = table.concat(current) end
+    return words
 end
+
 local function novaSegments(raw)
-    local escaped = raw:gsub("\\\\", "%%BackSlash%%")
-    local segments = splitString(escaped, "\\")
-    for i, item in ipairs(segments) do segments[i] = item:gsub("%%BackSlash%%", "\\") end
+    local segments, piece, quote = {}, {}, nil
+    local i = 1
+    while i <= #raw do
+        local ch = raw:sub(i, i)
+        if quote then
+            piece[#piece + 1] = ch
+            if ch == quote and raw:sub(i - 1, i - 1) ~= "\\" then quote = nil end
+        elseif ch == '"' or ch == "'" then
+            quote = ch
+            piece[#piece + 1] = ch
+        elseif ch == "\\" then
+            if raw:sub(i + 1, i + 1) == "\\" then
+                piece[#piece + 1] = "\\"
+                i = i + 1
+            else
+                segments[#segments + 1] = table.concat(piece)
+                piece = {}
+            end
+        else
+            piece[#piece + 1] = ch
+        end
+        i = i + 1
+    end
+    segments[#segments + 1] = table.concat(piece)
     return segments
 end
+
+local function novaLoopCount()
+    local count = 0
+    for _ in pairs(novaInfiniteLoops) do count = count + 1 end
+    return count
+end
+novaDispatch.loopCount = novaLoopCount
+novaDispatch.stopLoop = function(input)
+    local key = tostring(input or ""):lower()
+    local cmd = findCmd(key)
+    key = (cmd and cmd.NAME or key):lower()
+    if not novaInfiniteLoops[key] then return false end
+    novaInfiniteLoops[key] = nil
+    novaDispatch.cancelled = novaDispatch.cancelled + 1
+    return true
+end
+novaDispatch.stopAll = function()
+    novaDispatch.generation = novaDispatch.generation + 1
+    lastBreakTime = tick()
+    local n = 0
+    for name in pairs(novaInfiniteLoops) do
+        novaInfiniteLoops[name] = nil
+        n = n + 1
+    end
+    novaDispatch.cancelled = novaDispatch.cancelled + n
+    return n
+end
+
+local function novaInvoke(command, args, actor, requested, index, total, infinite)
+    -- Legacy callbacks may read cargs. The argument table remains local to
+    -- every invocation, while only legacy compatibility uses the global.
+    cargs = args
+    local ok, result = pcall(command.FUNC, args, actor)
+    novaDispatch.executed = novaDispatch.executed + 1
+    if not ok then
+        novaDispatch.failures = novaDispatch.failures + 1
+        -- The instrumented wrapper has already logged a detailed failure.
+        if not tostring(result):find("^%[NOVA:") then
+            recordCommandError(requested, result)
+        end
+        if _G.IY_DEBUG then warn("NOVA command failed:", requested, result) end
+        return false
+    end
+    if type(result) == "string" and not infinite and (index == 1 or index == total)
+        and not table.find(args, "nonotify") then
+        notify("Command: " .. requested, result)
+    end
+    return true
+end
+
+local function novaExecuteSegment(piece, actor, originalInput, saveHistory, guard)
+    local repetitions, seconds, infinite = 1, 0, false
+    local prefix, after = piece:match("^(%d+)%^(.*)$")
+    if prefix then
+        repetitions = math.clamp(tonumber(prefix) or 1, 1, 1000)
+        piece = after
+        local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
+        if waitValue then seconds, piece = tonumber(waitValue) or 0, rest end
+    elseif piece:sub(1, 4):lower() == "inf^" then
+        infinite = true
+        piece = piece:sub(5)
+        local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
+        if waitValue then seconds, piece = tonumber(waitValue) or 0.1, rest
+        else seconds = 0.1 end
+        seconds = math.clamp(seconds, 0.05, 60)
+    end
+    repetitions = math.floor(repetitions)
+    seconds = math.clamp(seconds, 0, 60)
+    if piece:sub(1, 1) == "!" then
+        local shortcut = novaWords(piece:sub(2))[1]
+        if shortcut and lastCmds[shortcut:lower()] then piece = lastCmds[shortcut:lower()] end
+    end
+    local args = novaWords(piece)
+    local requested = args[1] and args[1]:lower()
+    if not requested then return end
+    local command = findCmd(requested)
+    if not command or type(command.FUNC) ~= "function" then
+        recordCommandError(requested, "Unknown command")
+        return
+    end
+    table.remove(args, 1)
+    if saveHistory and actor == Players.LocalPlayer then
+        if cmdHistory[1] ~= originalInput and requested ~= "lastcommand" and requested ~= "lastcmd" then
+            table.insert(cmdHistory, 1, originalInput)
+            if #cmdHistory > 30 then table.remove(cmdHistory) end
+        end
+        lastCmds[requested] = piece
+    end
+    local began = tick()
+    if guard and guard.generation ~= novaDispatch.generation then return end
+    if infinite then
+        local key = command.NAME:lower()
+        if not novaInfiniteLoops[key] and novaLoopCount() >= novaDispatch.maxLoops then
+            novaDispatch.blocked = novaDispatch.blocked + 1
+            recordCommandError(requested, "Maximum concurrent repeating commands reached")
+            return
+        end
+        local marker = {name = key, interval = seconds, started = os.clock(), count = 0}
+        novaInfiniteLoops[key] = marker -- cancels the old copy, if any
+        task.spawn(function()
+            local failures = 0
+            while novaInfiniteLoops[key] == marker and lastBreakTime <= began
+                and (not guard or guard.generation == novaDispatch.generation) do
+                marker.count = marker.count + 1
+                if novaInvoke(command, args, actor, requested, marker.count, math.huge, true) then
+                    failures = 0
+                else
+                    failures = failures + 1
+                    if failures >= 3 then
+                        recordCommandError(key, "Repeating command stopped after three failures")
+                        break
+                    end
+                end
+                task.wait(seconds)
+            end
+            if novaInfiniteLoops[key] == marker then novaInfiniteLoops[key] = nil end
+        end)
+        return -- continue other chained commands; infinite tasks no longer block the chain
+    end
+    local failures = 0
+    for i = 1, repetitions do
+        if lastBreakTime > began or (guard and guard.generation ~= novaDispatch.generation) then break end
+        if guard then
+            if guard.remaining <= 0 then
+                novaDispatch.budgetStops = novaDispatch.budgetStops + 1
+                recordCommandError("dispatcher", "Batch execution budget reached; remaining calls cancelled")
+                break
+            end
+            guard.remaining = guard.remaining - 1
+        end
+        if novaInvoke(command, args, actor, requested, i, repetitions, false) then
+            failures = 0
+        else
+            failures = failures + 1
+            if failures >= 3 then break end
+        end
+        if seconds > 0 then task.wait(seconds)
+        elseif i % 15 == 0 then task.wait() end
+    end
+end
+
 function execCmd(cmdStr, speaker, store)
     if cmdStr == nil then return end
     cmdStr = tostring(cmdStr):gsub("^%s+", ""):gsub("%s+$", "")
     if cmdStr == "" then return end
     if #cmdStr > 4096 then
-        recordCommandError("dispatcher", "Command input exceeds 4096 characters")
+        recordCommandError("dispatcher", "Input exceeds 4096 characters")
+        novaDispatch.blocked = novaDispatch.blocked + 1
         return
     end
+    local segments = novaSegments(cmdStr)
+    if #segments > 40 then
+        recordCommandError("dispatcher", "Maximum of 40 chained commands")
+        novaDispatch.blocked = novaDispatch.blocked + 1
+        return
+    end
+    if novaDispatch.active >= novaDispatch.maxActive then
+        recordCommandError("dispatcher", "Too many active command batches; try again shortly")
+        novaDispatch.blocked = novaDispatch.blocked + 1
+        return
+    end
+    novaDispatch.active = novaDispatch.active + 1
+    novaDispatch.launched = novaDispatch.launched + 1
+    local guard = {generation = novaDispatch.generation, remaining = novaDispatch.maxBatchCalls}
     task.spawn(function()
-        local segments = novaSegments(cmdStr)
-        if #segments > 40 then
-            recordCommandError("dispatcher", "Maximum of 40 chained commands")
-            _G.IY_NOVA_DISPATCH.blocked = _G.IY_NOVA_DISPATCH.blocked + 1
-            return
-        end
-        local actor = speaker or Players.LocalPlayer
-        for _, rawPiece in ipairs(segments) do
-            local piece = rawPiece:gsub("^%s+", ""):gsub("%s+$", "")
-            local repetitions, delaySeconds, infinite = 1, 0, false
-            local prefix, after = piece:match("^(%d+)%^(.*)$")
-            if prefix then
-                repetitions = math.clamp(tonumber(prefix) or 1, 1, 1000)
-                piece = after
-                local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
-                if waitValue then delaySeconds, piece = tonumber(waitValue) or 0, rest end
-            elseif piece:sub(1, 4):lower() == "inf^" then
-                infinite = true
-                piece = piece:sub(5)
-                local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
-                if waitValue then delaySeconds, piece = tonumber(waitValue) or 0.10, rest
-                else delaySeconds = 0.10 end
-                delaySeconds = math.max(0.05, math.min(delaySeconds, 60))
+        local ok, err = pcall(function()
+            local actor = speaker or Players.LocalPlayer
+            for _, raw in ipairs(segments) do
+                if guard.generation ~= novaDispatch.generation or guard.remaining <= 0 then break end
+                local segment = raw:gsub("^%s+", ""):gsub("%s+$", "")
+                if segment ~= "" then novaExecuteSegment(segment, actor, cmdStr, store, guard) end
             end
-            repetitions = math.floor(repetitions)
-            delaySeconds = math.max(0, math.min(delaySeconds, 60))
-            if piece:sub(1, 1) == "!" then
-                local item = novaWords(piece:sub(2))[1]
-                if item and lastCmds[item:lower()] then piece = lastCmds[item:lower()] end
-            end
-            local args = novaWords(piece)
-            local requested = args[1] and args[1]:lower()
-            local command = requested and findCmd(requested)
-            if command and type(command.FUNC) == "function" then
-                table.remove(args, 1)
-                if store and actor == Players.LocalPlayer then
-                    if cmdHistory[1] ~= cmdStr and requested ~= "lastcommand" and requested ~= "lastcmd" then
-                        table.insert(cmdHistory, 1, cmdStr)
-                        if #cmdHistory > 30 then table.remove(cmdHistory) end
-                    end
-                    lastCmds[requested] = piece
-                end
-                local token = {}
-                if infinite then novaInfiniteLoops[command.NAME] = token end
-                local began = tick()
-                local iterations = infinite and math.huge or repetitions
-                local consecutiveFailures = 0
-                for index = 1, iterations do
-                    if lastBreakTime > began or (infinite and novaInfiniteLoops[command.NAME] ~= token) then break end
-                    cargs = args -- legacy compatibility only; command callbacks use their local args.
-                    local ok, returned = pcall(command.FUNC, args, actor)
-                    _G.IY_NOVA_DISPATCH.executed = _G.IY_NOVA_DISPATCH.executed + 1
-                    if not ok then
-                        consecutiveFailures = consecutiveFailures + 1
-                        recordCommandError(requested, returned)
-                        if _G.IY_DEBUG then warn("NOVA command failed:", requested, returned) end
-                        if consecutiveFailures >= 3 then break end
-                    else
-                        consecutiveFailures = 0
-                        if type(returned) == "string" and not infinite
-                            and (index == 1 or index == iterations)
-                            and not table.find(args, "nonotify") then
-                            notify("Command: " .. requested, returned)
-                        end
-                    end
-                    if infinite then task.wait(delaySeconds)
-                    elseif delaySeconds > 0 then task.wait(delaySeconds)
-                    elseif index % 20 == 0 then task.wait() end
-                end
-                if infinite and novaInfiniteLoops[command.NAME] == token then novaInfiniteLoops[command.NAME] = nil end
-            elseif requested and requested ~= "" then
-                recordCommandError(requested, "Unknown command")
-            end
+        end)
+        novaDispatch.active = math.max(0, novaDispatch.active - 1)
+        novaDispatch.completed = novaDispatch.completed + 1
+        if not ok then
+            novaDispatch.failures = novaDispatch.failures + 1
+            recordCommandError("dispatcher", err)
         end
     end)
 end
@@ -5267,11 +5422,29 @@ function addcmd(name, alias, func, plgn)
         return nil
     end
     local existing = findCmd(name)
-    if existing and existing.NAME:lower() == name:lower() then
-        if _G.IY_DEBUG then warn("Skipped duplicate command registration:", name) end
+    if existing then
+        if _G.IY_DEBUG then warn("Skipped ambiguous command registration:", name,
+            "already owned by", existing.NAME) end
         return existing
     end
-    local cmd = {NAME = name, ALIAS = type(alias) == "table" and alias or {}, FUNC = func, PLUGIN = plgn}
+    local cleanAliases, used = {}, {}
+    for _, raw in ipairs(type(alias) == "table" and alias or {}) do
+        if type(raw) == "string" then
+            local key = raw:lower():match("^%s*(.-)%s*$")
+            if key ~= "" and key ~= name:lower() and not used[key] then
+                used[key] = true
+                if not findCmd(key) then
+                    cleanAliases[#cleanAliases + 1] = raw
+                else
+                    _G.IY_NOVA_ALIAS_CONFLICTS = _G.IY_NOVA_ALIAS_CONFLICTS or {}
+                    if #_G.IY_NOVA_ALIAS_CONFLICTS < 100 then
+                        table.insert(_G.IY_NOVA_ALIAS_CONFLICTS, name .. ": " .. raw)
+                    end
+                end
+            end
+        end
+    end
+    local cmd = {NAME = name, ALIAS = cleanAliases, FUNC = func, PLUGIN = plgn}
     cmds[#cmds + 1] = cmd
     invalidateCommandIndex()
     local hook = _G.IY_NOVA_REBUILD_HOOK
@@ -5280,22 +5453,38 @@ function addcmd(name, alias, func, plgn)
 end
 
 function removecmd(cmd)
-	if cmd ~= " " then
-		for i = #cmds,1,-1 do
-			if cmds[i].NAME == cmd or FindInTable(cmds[i].ALIAS,cmd) then
-				table.remove(cmds, i)
-                invalidateCommandIndex()
-				for _, c in ipairs(CMDsF:GetChildren()) do
-                    if c:IsA("TextButton") and (string.find(c.Text, "^"..cmd.."$") or string.find(c.Text, "^"..cmd.." ") or string.find(c.Text, " "..cmd.."$") or string.find(c.Text, " "..cmd.." ")) then
-						c.TextTransparency = 0.7
-						c.MouseButton1Click:Connect(function()
-							notify(c.Text, "Command has been disabled by you or a plugin")
-						end)
-					end
-				end
-			end
-		end
-	end
+    if type(cmd) ~= "string" then return false end
+    local input = cmd:lower():match("^%s*(.-)%s*$")
+    if input == "" then return false end
+    local found = findCmd(input)
+    if not found then return false end
+    local canonical = tostring(found.NAME):lower()
+    local removed = false
+    for i = #cmds, 1, -1 do
+        if cmds[i] == found then
+            table.remove(cmds, i)
+            removed = true
+            break
+        end
+    end
+    if not removed then return false end
+    invalidateCommandIndex()
+    for _, item in ipairs(CMDsF:GetChildren()) do
+        if item:IsA("TextButton") then
+            local label = tostring(item:GetAttribute("Title") or item.Text):lower()
+            local first = label:match("^%s*([%w_]+)")
+            if first == canonical then
+                item.TextTransparency = 0.65
+                if not item:GetAttribute("NOVA_RemovedNotice") then
+                    item:SetAttribute("NOVA_RemovedNotice", true)
+                    item.MouseButton1Click:Connect(function()
+                        notify("Command disabled", "This command was removed from the registry.")
+                    end)
+                end
+            end
+        end
+    end
+    return true
 end
 
 function overridecmd(name, func)
@@ -13559,7 +13748,7 @@ do
         stroke = Color3.fromRGB(68, 82, 117),
     }
     local storePath = "IY_NOVA.iy"
-    local store = {favorites = {}, recent = {}, counts = {}, appearance = {theme="blue", scale=1}}
+    local store = {favorites = {}, recent = {}, counts = {}, appearance = {theme="blue", scale=1, quickbar=false}}
     local sessionRuns = 0
     local savePending = false
     local paletteOpen = false
@@ -13570,6 +13759,9 @@ do
     local groupCacheCount = -1
     local lastSearch = ""
     local refreshList
+    local refreshQuickbar
+    local pageLimit = 48
+    local paletteSelectionIndex = 1
     local activatePalette
     local setPaletteVisible
 
@@ -13582,6 +13774,7 @@ do
                 if type(loaded.appearance) == "table" then
                     local ap = loaded.appearance
                     if type(ap.theme) == "string" then store.appearance.theme = ap.theme end
+                    if type(ap.quickbar) == "boolean" then store.appearance.quickbar = ap.quickbar end
                     if type(ap.scale) == "number" and ap.scale == ap.scale then
                         store.appearance.scale = math.clamp(ap.scale, 0.8, 1.25)
                     end
@@ -13659,6 +13852,7 @@ do
         end
         saveSoon()
         if refreshList then refreshList() end
+        if refreshQuickbar then refreshQuickbar() end
         return not index
     end
 
@@ -13938,13 +14132,20 @@ do
     end
     resizePalette()
     if Scale then Scale:GetPropertyChangedSignal("Scale"):Connect(resizePalette) end
-    workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    local paletteCameraConnection
+    local function bindPaletteCamera()
+        if paletteCameraConnection then
+            paletteCameraConnection:Disconnect()
+            paletteCameraConnection = nil
+        end
+        local camera = workspace.CurrentCamera
+        if camera then
+            paletteCameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(resizePalette)
+        end
         resizePalette()
-    end)
-    -- Some cameras resize without being replaced.
-    if workspace.CurrentCamera then
-        workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(resizePalette)
     end
+    workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindPaletteCamera)
+    bindPaletteCamera()
 
     local function updateTabs()
         local core, nova = countGroups()
@@ -14070,20 +14271,25 @@ do
     refreshList = function()
         if not overlay or not overlay.Parent then return end
         for _, child in ipairs(listFrame:GetChildren()) do
-            if child:IsA("Frame") or child:IsA("TextLabel") then child:Destroy() end
+            if child:IsA("Frame") or child:IsA("TextLabel")
+                or (child:IsA("TextButton") and child.Name == "NOVA_LoadMore") then
+                child:Destroy()
+            end
         end
         updateTabs()
         updateCommandGroups()
         local q = search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
-        local shown = 0
-        local limit = 48 -- bounded UI work even with hundreds of commands
+        local shown, total = 0, 0
+        local limit = pageLimit -- 48 at first, optional extra pages (max 192)
         if mode == "Recent" then
             for _, raw in ipairs(store.recent) do
                 local key = normalizeName(raw)
-                if shown >= limit then break end
                 if q == "" or raw:lower():find(q, 1, true) then
-                    shown = shown + 1
-                    appendRow(raw, key and commandHelp(key) or "Previous command", key, shown)
+                    total = total + 1
+                    if shown < limit then
+                        shown = shown + 1
+                        appendRow(raw, key and commandHelp(key) or "Previous command", key, shown)
+                    end
                 end
             end
         else
@@ -14113,6 +14319,7 @@ do
                 end
                 return a.name:lower() < b.name:lower()
             end)
+            total = #candidates
             for _, row in ipairs(candidates) do
                 if shown >= limit then break end
                 shown = shown + 1
@@ -14122,8 +14329,35 @@ do
         if shown == 0 then
             addEmpty(mode == "Favorites" and "No favorites yet. Star a command to keep it here."
                 or "No commands found in this category. Try another search or tab.")
+        elseif total > shown then
+            local more = node("TextButton", listFrame, {
+                Name = "NOVA_LoadMore", LayoutOrder = shown + 1,
+                Size = UDim2.new(1, -5, 0, 36), BackgroundColor3 = theme.hover,
+                TextColor3 = theme.text, Font = Enum.Font.GothamSemibold,
+                TextSize = 12, ZIndex = 65,
+                Text = pageLimit >= 192 and "Refine search to see more results"
+                    or string.format("Load more  •  %d of %d shown", shown, total)
+            })
+            round(more, 8)
+            more.MouseButton1Click:Connect(function()
+                if pageLimit >= 192 then return end
+                local y = listFrame.CanvasPosition.Y
+                pageLimit = math.min(192, pageLimit + 48)
+                refreshList()
+                listFrame.CanvasPosition = Vector2.new(0, y)
+            end)
         end
-        listFrame.CanvasPosition = Vector2.new(0, 0)
+        footerHint.Text = string.format("SHOWING %d / %d  •  ↑ / ↓ SELECT  •  ENTER TO EDIT  •  ESC TO CLOSE", shown, total)
+        if pageLimit == 48 then listFrame.CanvasPosition = Vector2.new(0, 0) end
+        local selected = nil
+        local selectedIndex = math.clamp(paletteSelectionIndex or 1, 1, math.max(1, shown))
+        paletteSelectionIndex = selectedIndex
+        for _, row in ipairs(listFrame:GetChildren()) do
+            if row:IsA("Frame") and row.Name == "NOVA_Row" then
+                row.BackgroundColor3 = row.LayoutOrder == selectedIndex and theme.hover or theme.bg
+                if row.LayoutOrder == selectedIndex then selected = row end
+            end
+        end
     end
 
     setPaletteVisible = function(state)
@@ -14148,6 +14382,7 @@ do
     for tab, button in pairs(buttons) do
         button.MouseButton1Click:Connect(function()
             mode = tab
+            pageLimit = 48
             if tab ~= "NOVA Additions" then group = "All" end
             refreshList()
         end)
@@ -14156,25 +14391,57 @@ do
         button.MouseButton1Click:Connect(function()
             group = category
             mode = "NOVA Additions"
+            pageLimit = 48
             refreshList()
         end)
     end
     local refreshToken = 0
+    local function listedRows()
+        local rows = {}
+        for _, item in ipairs(listFrame:GetChildren()) do
+            if item:IsA("Frame") and item.Name == "NOVA_Row" then
+                rows[#rows + 1] = item
+            end
+        end
+        table.sort(rows, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+        return rows
+    end
+    local function movePaletteSelection(change)
+        local rows = listedRows()
+        if #rows == 0 then return end
+        paletteSelectionIndex = math.clamp(paletteSelectionIndex + change, 1, #rows)
+        for i, item in ipairs(rows) do
+            item.BackgroundColor3 = (i == paletteSelectionIndex) and theme.hover or theme.bg
+        end
+        local chosen = rows[paletteSelectionIndex]
+        if chosen and chosen.Parent then
+            -- Keep the selection visible without an expensive list rebuild.
+            local top = chosen.AbsolutePosition.Y - listFrame.AbsolutePosition.Y
+                + listFrame.CanvasPosition.Y
+            local y = listFrame.CanvasPosition.Y
+            if top < y then
+                listFrame.CanvasPosition = Vector2.new(0, math.max(0, top))
+            elseif top + chosen.AbsoluteSize.Y > y + listFrame.AbsoluteSize.Y then
+                listFrame.CanvasPosition = Vector2.new(0,
+                    math.max(0, top + chosen.AbsoluteSize.Y - listFrame.AbsoluteSize.Y))
+            end
+        end
+    end
     search:GetPropertyChangedSignal("Text"):Connect(function()
+        paletteSelectionIndex = 1
         refreshToken = refreshToken + 1
         local token = refreshToken
-        task.defer(function()
+        pageLimit = 48
+        task.delay(0.075, function()
             if token == refreshToken and paletteOpen then refreshList() end
         end)
     end)
     search.FocusLost:Connect(function(submitted)
         if submitted and paletteOpen then
-            local first = nil
-            for _, child in ipairs(listFrame:GetChildren()) do
-                if child:IsA("Frame") then first = child break end
-            end
-            if first then
-                local commandName = first:GetAttribute("CommandText")
+            local rows = listedRows()
+            local selected = rows[math.clamp(paletteSelectionIndex, 1, #rows)]
+            if selected then
+                local commandName = selected:GetAttribute("CommandText")
                 if commandName then
                     selectCommand(commandName)
                     commandInput:CaptureFocus()
@@ -14207,6 +14474,15 @@ do
         if input.KeyCode == Enum.KeyCode.Escape and paletteOpen then
             setPaletteVisible(false)
             return
+        end
+        if paletteOpen and UserInputService:GetFocusedTextBox() == search then
+            if input.KeyCode == Enum.KeyCode.Down then
+                movePaletteSelection(1)
+                return
+            elseif input.KeyCode == Enum.KeyCode.Up then
+                movePaletteSelection(-1)
+                return
+            end
         end
         if gameProcessed or UserInputService:GetFocusedTextBox() then return end
         if input.KeyCode == Enum.KeyCode.F2
@@ -14254,7 +14530,7 @@ do
                 local fps = math.floor(frames / accumulated + 0.5)
                 frames, accumulated = 0, 0
                 local ping = "n/a"
-                pcall(function() ping = string.format("%.0f ms", localPlayer:GetNetworkPing() * 2000) end)
+                pcall(function() ping = string.format("%.0f ms", localPlayer:GetNetworkPing() * 1000) end)
                 local mem = "n/a"
                 pcall(function() mem = string.format("%.0f MB", StatsService:GetTotalMemoryUsageMb()) end)
                 perfLabel.Text = string.format("FPS     %d\nPing    %s\nMemory  %s", fps, ping, mem)
@@ -14360,6 +14636,7 @@ do
         store.favorites = {}
         saveSoon()
         refreshList()
+        if refreshQuickbar then refreshQuickbar() end
         return "Favorites cleared."
     end)
     addcmd("cmdsearch", {"commandsearch"}, function(args)
@@ -14541,6 +14818,90 @@ do
         if Scale then Scale.Scale = math.clamp(store.appearance.scale or 1, 0.8, 1.25) end
     end)
     applyAccent(store.appearance.theme or "blue")
+    -- Pinned quick-access dock: compact buttons using *existing favorite names*.
+    -- No new per-frame work, and it follows the palette's persisted preferences.
+    local quickbar = node("Frame", ScaledHolder, {
+        Name = "NOVA_Quickbar", Visible = store.appearance.quickbar, Active = true,
+        Position = UDim2.new(0, 14, 0, 126), Size = UDim2.fromOffset(212, 44),
+        BackgroundColor3 = theme.bg, BackgroundTransparency = 0.04, ZIndex = 36
+    })
+    round(quickbar, 10)
+    dragGUI(quickbar)
+    node("UIStroke", quickbar, {Color = theme.stroke, Thickness = 1, Transparency = 0.2})
+    local qbTitle = node("TextLabel", quickbar, {
+        Name = "Title", Position = UDim2.fromOffset(9, 5), Size = UDim2.new(1, -36, 0, 20),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = theme.accent, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "✦  NOVA QUICKBAR", ZIndex = 37
+    })
+    local qbClose = node("TextButton", quickbar, {
+        Name = "CloseQuickbar", Position = UDim2.new(1, -28, 0, 5),
+        Size = UDim2.fromOffset(22, 21), BackgroundColor3 = theme.hover,
+        TextColor3 = theme.text, Font = Enum.Font.GothamBold, TextSize = 16,
+        Text = "×", ZIndex = 37
+    })
+    round(qbClose, 6)
+    local function setQuickbar(enabled)
+        quickbar.Visible = enabled == true
+        store.appearance.quickbar = quickbar.Visible
+        saveSoon()
+        return quickbar.Visible
+    end
+    qbClose.MouseButton1Click:Connect(function() setQuickbar(false) end)
+    refreshQuickbar = function()
+        if not quickbar.Parent then return end
+        qbTitle.TextColor3 = theme.accent
+        for _, child in ipairs(quickbar:GetChildren()) do
+            if child:IsA("TextButton") and child.Name == "FavoriteRun" then child:Destroy() end
+            if child:IsA("TextLabel") and child.Name == "EmptyFavorites" then child:Destroy() end
+        end
+        local available = {}
+        for _, name in ipairs(store.favorites) do
+            if findCmd(name) then
+                available[#available + 1] = name
+                if #available >= 5 then break end
+            end
+        end
+        local count = #available
+        quickbar.Size = UDim2.fromOffset(212, count == 0 and 62 or (36 + count * 32))
+        if count == 0 then
+            node("TextLabel", quickbar, {
+                Name = "EmptyFavorites", Position = UDim2.fromOffset(8, 28),
+                Size = UDim2.new(1, -16, 0, 27), BackgroundTransparency = 1,
+                Text = "Star a command in the palette to pin it.",
+                TextColor3 = theme.muted, Font = Enum.Font.Gotham, TextSize = 11,
+                TextWrapped = true, ZIndex = 37
+            })
+            return
+        end
+        for i, name in ipairs(available) do
+            local target = name
+            local button = node("TextButton", quickbar, {
+                Name = "FavoriteRun", Position = UDim2.fromOffset(7, 28 + (i - 1) * 32),
+                Size = UDim2.new(1, -14, 0, 28),
+                BackgroundColor3 = theme.panel, TextColor3 = theme.text,
+                Text = string.format("★  %s", target), TextTruncate = Enum.TextTruncate.AtEnd,
+                Font = Enum.Font.GothamSemibold, TextSize = 12,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = 37
+            })
+            round(button, 6)
+            node("UIPadding", button, {PaddingLeft = UDim.new(0, 9)})
+            button.MouseButton1Click:Connect(function()
+                if findCmd(target) then execCmd(target, localPlayer, true) end
+            end)
+        end
+    end
+    refreshQuickbar()
+    addcmd("novaquickbar", {"nqbar"}, function(args)
+        local state = tostring(args[1] or "toggle"):lower()
+        if state == "off" or state == "hide" then setQuickbar(false)
+        elseif state == "on" or state == "show" then setQuickbar(true)
+        else setQuickbar(not quickbar.Visible) end
+        if quickbar.Visible then refreshQuickbar() end
+        return "Quickbar " .. (quickbar.Visible and "enabled" or "disabled") .. "."
+    end)
+    addcmdtext("novaquickbar [on/off]", "NOVA", "Pin your first five favorite commands in a movable-feeling compact dock.")
     _G.IY_NOVA_UI = {
         open = function(section) activatePalette(section or "All") end,
         refresh = function() groupCacheCount = -1; refreshList() end,
@@ -14549,6 +14910,8 @@ do
         original = originalCommandNames,
         counts = countGroups,
         isOpen = function() return paletteOpen end,
+        quickbar = setQuickbar,
+        refreshQuickbar = refreshQuickbar,
     }
     IndexContents("", true)
     if _G.IY_DEBUG then print("[NOVA] Extension loaded. F2 or Ctrl+K opens palette.") end
@@ -17344,9 +17707,23 @@ do
                     if token ~= runtime.pathToken or hum.Health <= 0 then break end
                     if point.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
                     hum:MoveTo(point.Position)
-                    local reached = hum.MoveToFinished:Wait()
+                    -- MoveToFinished:Wait() is not cancellable; poll with a
+                    -- distance-based timeout so unnovapath reacts immediately.
+                    local waypointStart = os.clock()
+                    local initialDistance = (rp.Position - point.Position).Magnitude
+                    local timeout = math.clamp(initialDistance / math.max(4, hum.WalkSpeed) + 2, 3, 13)
+                    local reached = false
+                    while token == runtime.pathToken and hum.Parent and hum.Health > 0 do
+                        if not rp.Parent then break end
+                        if (rp.Position - point.Position).Magnitude <= 3.5 then
+                            reached = true
+                            break
+                        end
+                        if os.clock() - waypointStart > timeout then break end
+                        task.wait(0.08)
+                    end
                     if token ~= runtime.pathToken or not reached then
-                        runtime.status = "Path blocked or cancelled"
+                        if token == runtime.pathToken then runtime.status = "Path blocked or timed out" end
                         break
                     end
                 end
@@ -17415,7 +17792,8 @@ do
         hum.WalkSpeed = speed
         task.delay(duration, function()
             if token == runtime.burstToken then
-                if hum.Parent then hum.WalkSpeed = original end
+                -- Restore only the humanoid that received the temporary boost.
+                if hum.Parent and hum == meHumanoid() then hum.WalkSpeed = original end
                 runtime.burstSpeed = nil
             end
         end)
@@ -17452,6 +17830,14 @@ do
         runtime.burstSpeed = nil
         runtime.status = "Stopped"
         return "All NOVA Studio activity stopped."
+    end)
+    -- A temporary speed lease must not affect the replacement character.
+    plr.CharacterAdded:Connect(function()
+        runtime.burstToken = runtime.burstToken + 1
+        runtime.burstSpeed = nil
+        runtime.pathToken = runtime.pathToken + 1
+        runtime.pathRunning = false
+        runtime.status = "Character respawned; navigation cancelled"
     end)
     -- Remove local adornments and stop loops if the character/session exits.
     plr.AncestryChanged:Connect(function(_, parent)
@@ -18177,7 +18563,9 @@ do
                 stat.failures = stat.failures + 1
                 stat.lastError = tostring(result):sub(1, 400)
                 log(name, result)
-                return "Command failed: " .. name .. " (see nverrors)"
+                -- Do not turn exceptions into apparent successes. The dispatcher
+                -- catches this and stops repeated commands after three failures.
+                error("[NOVA:" .. name .. "] " .. tostring(result), 0)
             end
             return result
         end
@@ -18295,4 +18683,460 @@ do
     RB.audit()
     if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
     if _G.IY_DEBUG then print("[NOVA Rebuild] All", RB.auditCount, "commands wrapped;", RB.patchCount, "individually repaired") end
+end
+
+
+--[[
+  NOVA HELIX | 2026-11-20
+  Reliability commands, bounded recipes and progression metrics.
+  Compatible with old IY/NOVA names. No automatic purchases or server spoofing.
+]]
+do
+    local H = {version = "4.0.0", recipes = {}, recipeToken = 0, activeRecipe = nil,
+        metrics = nil, metricSince = nil, metricFilter = nil, registered = 0}
+    _G.IY_NOVA_HELIX = H
+    local me = Players.LocalPlayer
+    local recipePath = "IY_NOVA_RECIPES.iy"
+    local function register(name, aliases, usage, details, handler)
+        if findCmd(name) then return false end
+        addcmd(name, aliases, handler)
+        addcmdtext(usage, "NOVA HELIX", details)
+        H.registered = H.registered + 1
+        return true
+    end
+    local function statusText()
+        local d = _G.IY_NOVA_DISPATCH
+        local rb = _G.IY_NOVA_REBUILD
+        local loopCount = d and d.loopCount and d.loopCount() or 0
+        local last = rb and rb.lastAudit or {}
+        return string.format("HELIX %s | %d registered | workers %d/%d | loops %d | command calls %d | errors %d | registry warnings %d",
+            H.version, #cmds, d and d.active or 0, d and d.maxActive or 0,
+            loopCount, d and d.executed or 0, d and d.failures or 0,
+            #(last.issues or {}))
+    end
+    register("novahealth", {"nhealth"}, "novahealth", "Show active workers, loops, error counts and registry health.", function()
+        return statusText()
+    end)
+    register("novaloops", {"nloops"}, "novaloops", "List currently running infinite command tasks.", function()
+        local d = _G.IY_NOVA_DISPATCH
+        local lines = {}
+        for name, detail in pairs(d.infinite) do
+            lines[#lines + 1] = string.format("%s  (%d runs, %.2fs delay)", name, detail.count or 0, detail.interval or 0)
+        end
+        table.sort(lines)
+        if #lines == 0 then return "No infinite command tasks are running." end
+        notify("NOVA / ACTIVE COMMAND LOOPS", table.concat(lines, "\n"):sub(1, 1300), 14)
+    end)
+    register("novastoploop", {"nstoploop"}, "novastoploop [name/all]", "Stop one infinite command or all repeating command tasks.", function(args)
+        local target = tostring(args[1] or ""):lower()
+        if target == "" then return "Usage: novastoploop [command/all]" end
+        local d = _G.IY_NOVA_DISPATCH
+        if target == "all" then
+            local count = d.stopAll()
+            return "Stopped " .. count .. " repeating tasks and cancelled active command batches."
+        end
+        return d.stopLoop(target) and ("Stopped repeating " .. target .. ".")
+            or ("No running repeating task for " .. target .. ".")
+    end)
+    register("novaworkers", {"nworkers"}, "novaworkers [2-16]", "Limit simultaneous command batches to prevent executor overload.", function(args)
+        local d = _G.IY_NOVA_DISPATCH
+        if not args[1] then return string.format("Worker limit: %d | Active: %d", d.maxActive, d.active) end
+        local n = tonumber(args[1])
+        if not n or n ~= n or n == math.huge or n == -math.huge then return "Usage: novaworkers [2-16]" end
+        d.maxActive = math.clamp(math.floor(n), 2, 16)
+        return "Maximum simultaneous command batches: " .. d.maxActive
+    end)
+    register("novasafestop", {"nstopall"}, "novasafestop", "Cancel managed loops, recipes and recently patched character mechanics.", function()
+        local d = _G.IY_NOVA_DISPATCH
+        local loops = d.stopAll()
+        H.recipeToken = H.recipeToken + 1
+        H.activeRecipe = nil
+        local stop = findCmd("nvrestore")
+        if stop then pcall(stop.FUNC, {}, me) end
+        return string.format("Stopped %d looping tasks, recipes, and managed movement effects.", loops)
+    end)
+
+    local function validRecipeName(raw)
+        if type(raw) ~= "string" or #raw == 0 or #raw > 24 then return nil end
+        if not raw:match("^[%w_%-]+$") then return nil end
+        return raw:lower()
+    end
+    local function recipeKeys()
+        local names = {}
+        for name in pairs(H.recipes) do names[#names + 1] = name end
+        table.sort(names)
+        return names
+    end
+    local function saveRecipes()
+        if type(waxwritefile) ~= "function" then return false end
+        local okay, encoded = pcall(function() return HttpService:JSONEncode({version=1, recipes=H.recipes}) end)
+        if not okay then return false end
+        return pcall(waxwritefile, recipePath, encoded)
+    end
+    if type(waxreadfile) == "function" then
+        local success, content = pcall(waxreadfile, recipePath)
+        if success and type(content) == "string" and #content < 32000 then
+            local valid, decoded = pcall(function() return HttpService:JSONDecode(content) end)
+            if valid and type(decoded) == "table" and type(decoded.recipes) == "table" then
+                local count = 0
+                for name, steps in pairs(decoded.recipes) do
+                    if count >= 20 then break end
+                    if validRecipeName(name) and type(steps) == "table" and #steps <= 8 then
+                        local cleaned = {}
+                        for _, step in ipairs(steps) do
+                            if type(step) == "string" and #step <= 180 then
+                                local first = step:match("^%s*([^%s]+)")
+                                if first and findCmd(first)
+                                    and first:lower() ~= "novarecipe" and first:lower() ~= "nrecipe" then
+                                    cleaned[#cleaned + 1] = step
+                                end
+                            end
+                        end
+                        if #cleaned > 0 then H.recipes[name:lower()] = cleaned; count = count + 1 end
+                    end
+                end
+            end
+        end
+    end
+    register("novarecipe", {"nrecipe"},
+        "novarecipe [save/list/show/run/delete/stop] ...",
+        "Save and replay up to eight validated commands. Separate steps with |.", function(args)
+        local operation = tostring(args[1] or "list"):lower()
+        if operation == "list" then
+            local names = recipeKeys()
+            return #names == 0 and "No recipes saved. Example: novarecipe save setup perfmon | novastatview"
+                or ("Recipes (" .. #names .. "): " .. table.concat(names, ", "))
+        end
+        if operation == "stop" then
+            H.recipeToken = H.recipeToken + 1
+            H.activeRecipe = nil
+            return "Recipe dispatch cancelled. Already-running commands may still finish."
+        end
+        local name = validRecipeName(args[2])
+        if not name then return "Usage: novarecipe [save/show/run/delete] [name] ..." end
+        if operation == "show" then
+            local steps = H.recipes[name]
+            return steps and (name .. ": " .. table.concat(steps, " | ")) or "Unknown recipe."
+        elseif operation == "delete" then
+            if not H.recipes[name] then return "Unknown recipe." end
+            H.recipes[name] = nil
+            saveRecipes()
+            return "Deleted recipe: " .. name
+        elseif operation == "save" then
+            if #recipeKeys() >= 20 and not H.recipes[name] then return "Maximum 20 recipes reached." end
+            local raw = table.concat(args, " ", 3)
+            if #raw > 1000 then return "Recipe is too long (limit 1000 characters)." end
+            local steps = {}
+            for text in (raw .. "|"):gmatch("(.-)|") do
+                local step = text:match("^%s*(.-)%s*$")
+                if step ~= "" then
+                    if #step > 180 or #steps >= 8 then return "A recipe may contain at most 8 steps (180 chars each)." end
+                    local first = step:match("^([^%s]+)")
+                    if not first or not findCmd(first) or first:lower() == "novarecipe"
+                        or first:lower() == "nrecipe" then
+                        return "Unknown or recursive step: " .. tostring(first)
+                    end
+                    steps[#steps + 1] = step
+                end
+            end
+            if #steps == 0 then return "Add commands separated by | after the recipe name." end
+            H.recipes[name] = steps
+            saveRecipes()
+            return string.format("Saved recipe %s with %d steps.", name, #steps)
+        elseif operation == "run" then
+            local steps = H.recipes[name]
+            if not steps then return "Unknown recipe." end
+            if H.activeRecipe then return "Another recipe is active; use novarecipe stop first." end
+            H.recipeToken = H.recipeToken + 1
+            local token = H.recipeToken
+            H.activeRecipe = name
+            task.spawn(function()
+                for _, step in ipairs(steps) do
+                    if token ~= H.recipeToken then break end
+                    execCmd(step, me, true)
+                    task.wait(0.45)
+                end
+                if token == H.recipeToken then H.activeRecipe = nil end
+            end)
+            return "Started recipe " .. name .. " (" .. #steps .. " steps)."
+        end
+        return "Usage: novarecipe [save/list/show/run/delete/stop]"
+    end)
+    register("novarecipestatus", {"nrecipestatus"}, "novarecipestatus", "Check recipe state and persistence.", function()
+        return string.format("Recipes: %d/20 | Running: %s | Persistence: %s", #recipeKeys(),
+            H.activeRecipe or "none", type(waxwritefile) == "function" and "available" or "session-only")
+    end)
+
+    local function getNumberValues()
+        local collected, visited = {}, 0
+        for _, obj in ipairs(me:GetDescendants()) do
+            visited = visited + 1
+            if visited > 1800 or #collected >= 80 then break end
+            if obj:IsA("NumberValue") or obj:IsA("IntValue") then
+                local value = tonumber(obj.Value)
+                if value and value == value and math.abs(value) ~= math.huge then
+                    collected[#collected + 1] = {ref=obj, name=obj.Name, value=value}
+                end
+            end
+        end
+        return collected
+    end
+    register("novametric", {"nmetric"}, "novametric [start/show/stop] [stat-filter]",
+        "Measure changes in client-visible numeric progression stats.", function(args)
+        local action = tostring(args[1] or "show"):lower()
+        if action == "stop" or action == "clear" then
+            H.metrics, H.metricSince, H.metricFilter = nil, nil, nil
+            return "Progress metric baseline cleared."
+        elseif action == "start" then
+            H.metrics = {}
+            H.metricFilter = table.concat(args, " ", 2):lower()
+            local items = getNumberValues()
+            for _, item in ipairs(items) do
+                if H.metricFilter == "" or item.name:lower():find(H.metricFilter, 1, true) then
+                    H.metrics[#H.metrics + 1] = item
+                end
+            end
+            H.metricSince = os.clock()
+            return string.format("Tracking %d numeric values (baseline captured).", #H.metrics)
+        elseif action == "show" then
+            if not H.metrics then return "No baseline. Use novametric start [optional stat name]." end
+            local elapsed = math.max(0.01, os.clock() - H.metricSince)
+            local changes = {}
+            for _, item in ipairs(H.metrics) do
+                if item.ref.Parent then
+                    local ok, current = pcall(function() return tonumber(item.ref.Value) end)
+                    if ok and current and current == current and math.abs(current) ~= math.huge then
+                        local delta = current - item.value
+                        if delta ~= 0 then
+                            changes[#changes + 1] = {name=item.name, delta=delta, rate=delta/elapsed}
+                        end
+                    end
+                end
+            end
+            table.sort(changes, function(a,b) return math.abs(a.delta) > math.abs(b.delta) end)
+            if #changes == 0 then return string.format("No numeric stat changes over %.1fs (%d tracked).", elapsed, #H.metrics) end
+            local lines = {}
+            for i = 1, math.min(6, #changes) do
+                local e = changes[i]
+                lines[#lines + 1] = string.format("%s  %+g  (%+.2f/s)", e.name, e.delta, e.rate)
+            end
+            notify("NOVA / PROGRESSION DELTAS", table.concat(lines, "\n"), 16)
+            return string.format("Observed %d changed stats over %.1fs.", #changes, elapsed)
+        end
+        return "Usage: novametric [start/show/stop] [optional name]"
+    end)
+    register("novaexporthealth", {"nexporthealth"}, "novaexporthealth", "Copy local command health diagnostics as JSON when clipboard is available.", function()
+        if type(everyClipboard) ~= "function" then return "Clipboard API not available." end
+        local d = _G.IY_NOVA_DISPATCH
+        local rb = _G.IY_NOVA_REBUILD
+        local payload = {version=H.version, commandCount=#cmds, activeWorkers=d.active,
+            maxWorkers=d.maxActive, activeLoops=d.loopCount(), calls=d.executed,
+            errors=d.failures, blocked=d.blocked, corrected=rb and rb.patchCount or 0,
+            recentErrors={}}
+        local records = _G.IY_NOVA_ERRORS or {}
+        for i=1, math.min(8,#records) do
+            payload.recentErrors[i] = {command=tostring(records[i].command or ""),
+                message=tostring(records[i].message or ""):sub(1,180)}
+        end
+        local ok, data = pcall(function() return HttpService:JSONEncode(payload) end)
+        if not ok then return "JSON diagnostics unavailable." end
+        local done = pcall(everyClipboard, data)
+        return done and "Copied diagnostics JSON locally; no network upload was performed."
+            or "Clipboard write failed."
+    end)
+    register("novahelixhelp", {"nhelix"}, "novahelixhelp", "Show reliability commands, recipes and stat tracking.", function()
+        notify("NOVA HELIX / COMMANDS",
+            "novahealth | novaloops | novastoploop [name/all] | novaworkers [2-16] | " ..
+            "novasafestop | novarecipe [save/list/show/run/delete/stop] | " ..
+            "novametric [start/show/stop] | novaquickbar [on/off] | novaexporthealth", 18)
+    end)
+    if _G.IY_NOVA_REBUILD and _G.IY_NOVA_REBUILD.audit then
+        pcall(_G.IY_NOVA_REBUILD.audit)
+    end
+    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
+    if type(IndexContents) == "function" then pcall(IndexContents, "", true) end
+    if _G.IY_DEBUG then print("[NOVA HELIX] Registered", H.registered, "additional commands") end
+end
+
+
+--[[
+ NOVA HELIX v4 | Recovery and Diagnostics
+ No remote manipulation, bypass logic, or network telemetry.
+ All actions run locally and preserve existing command names.
+]]
+do
+    local V4 = {version = "4.0.0", registered = 0, cleanupFailures = {},
+        startedAt = os.clock(), snapshots = nil}
+    _G.IY_NOVA_HELIX_V4 = V4
+    local me = Players.LocalPlayer
+    local function reg(name, aliases, desc, handler)
+        if findCmd(name) then return false end
+        local command = addcmd(name, aliases, handler)
+        if command and command.NAME == name then
+            addcmdtext(name, "NOVA HELIX V4", desc)
+            V4.registered = V4.registered + 1
+            return true
+        end
+        return false
+    end
+    local function invokeExisting(name)
+        local command = findCmd(name)
+        if not command then return false, "missing" end
+        local ok, result = pcall(command.FUNC, {}, me)
+        return ok, result
+    end
+    local function stopEverything()
+        local d = _G.IY_NOVA_DISPATCH
+        local loops = d and d.stopAll and d.stopAll() or 0
+        local helix = _G.IY_NOVA_HELIX
+        if helix then
+            helix.recipeToken = helix.recipeToken + 1
+            helix.activeRecipe = nil
+        end
+        local stopped, failed = 0, {}
+        -- Every module keeps its own reversible teardown; use those APIs.
+        local cleanup = {
+            "progshutdown", "cheatshutdown", "novastopall", "nvrestore",
+            "unmultijump", "unbunnyhop", "unglide", "unwallclimb",
+            "unsprint", "untracers", "unradar", "undistancetags",
+            "untoolesp", "unaimassist", "unperfmon"
+        }
+        for _, command in ipairs(cleanup) do
+            if findCmd(command) then
+                local ok, err = invokeExisting(command)
+                if ok then stopped = stopped + 1
+                else failed[#failed + 1] = command .. ": " .. tostring(err):sub(1, 80) end
+            end
+        end
+        V4.cleanupFailures = failed
+        local msg = string.format("Cancelled %d repeating tasks; ran %d cleanup handlers.", loops, stopped)
+        if #failed > 0 then
+            msg = msg .. " Failed: " .. table.concat(failed, ", "):sub(1, 220)
+        end
+        return msg
+    end
+    -- Keep previous stop command name, but extend its scope to all NOVA packs.
+    overridecmd("novasafestop", function() return stopEverything() end)
+    reg("novapanic", {"novaemergency", "nresetall"},
+        "Stop managed gameplay, progression, navigation, overlays and repeat tasks.",
+        function() return stopEverything() end)
+
+    reg("novabudget", {"nbudget"},
+        "Get or set the maximum number of command calls in one dispatch batch.",
+        function(args)
+            local d = _G.IY_NOVA_DISPATCH
+            if not args[1] then return "Command batch budget: " .. tostring(d.maxBatchCalls) end
+            local n = tonumber(args[1])
+            if not n or n ~= n or n == math.huge or n == -math.huge
+                or n ~= math.floor(n) or n < 50 or n > 4000 then
+                return "Usage: novabudget [integer 50-4000]"
+            end
+            d.maxBatchCalls = n
+            return "Per-batch command limit set to " .. n
+        end)
+
+    reg("novaauditlive", {"nauditlive", "novaverify"},
+        "Inspect registered commands, aliases, callbacks, API availability and worker state.",
+        function()
+            local seen, conflicts = {}, {}
+            local missingCallbacks, registered = 0, 0
+            for _, command in ipairs(cmds) do
+                registered = registered + 1
+                if type(command.FUNC) ~= "function" then missingCallbacks = missingCallbacks + 1 end
+                local names = {command.NAME}
+                for _, alias in ipairs(command.ALIAS or {}) do names[#names + 1] = alias end
+                for _, name in ipairs(names) do
+                    local key = tostring(name):lower()
+                    if seen[key] and #conflicts < 8 then
+                        conflicts[#conflicts + 1] = key
+                    else
+                        seen[key] = true
+                    end
+                end
+            end
+            local d = _G.IY_NOVA_DISPATCH
+            local detail = string.format(
+                "Commands: %d | missing callbacks: %d | duplicate names/aliases (sample): %d | workers: %d/%d | loop count: %d | cancelled by budget: %d | clipboard: %s | settings files: %s",
+                registered, missingCallbacks, #conflicts,
+                d and d.active or 0, d and d.maxActive or 0,
+                d and d.loopCount and d.loopCount() or 0,
+                d and d.budgetStops or 0,
+                type(everyClipboard) == "function" and "yes" or "no",
+                type(waxreadfile) == "function" and type(waxwritefile) == "function" and "yes" or "no")
+            if #conflicts > 0 then detail = detail .. "\nConflicts: " .. table.concat(conflicts, ", ") end
+            notify("NOVA HELIX / LIVE AUDIT", detail, 15)
+            return detail
+        end)
+
+    reg("novacmdinspect", {"ncmdinspect"},
+        "Inspect a command's aliases, source group and usage without executing it.",
+        function(args)
+            local raw = args[1]
+            if not raw or raw == "" then return "Usage: novacmdinspect [command name]" end
+            local command = findCmd(raw)
+            if not command then return "Unknown command: " .. tostring(raw) end
+            local group = "Unknown"
+            local ui = _G.IY_NOVA_UI
+            if ui and type(ui.category) == "function" then
+                local ok, value = pcall(ui.category, command.NAME)
+                if ok then group = tostring(value) end
+            end
+            local aliases = table.concat(command.ALIAS or {}, ", ")
+            local detail = string.format("%s | %s | Aliases: %s | Callback: %s",
+                tostring(command.NAME), group, aliases ~= "" and aliases or "none",
+                type(command.FUNC))
+            notify("NOVA / COMMAND DETAILS", detail, 12)
+            return detail
+        end)
+
+    local function getBody()
+        local character = me.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        return humanoid
+    end
+    reg("novaphysics", {"nphysics"},
+        "Save or restore local movement and camera properties (does not alter server stats).",
+        function(args)
+            local action = tostring(args[1] or "status"):lower()
+            local hum = getBody()
+            local camera = workspace.CurrentCamera
+            if action == "save" then
+                if not hum then return "Character is not ready." end
+                V4.snapshots = {humanoid = hum,
+                    walkSpeed = hum.WalkSpeed, useJumpPower = hum.UseJumpPower,
+                    jumpPower = hum.JumpPower, jumpHeight = hum.JumpHeight,
+                    hipHeight = hum.HipHeight, gravity = workspace.Gravity,
+                    camera = camera, fov = camera and camera.FieldOfView or nil}
+                return "Saved local movement, gravity and camera FOV snapshot."
+            elseif action == "restore" then
+                local snap = V4.snapshots
+                if not snap then return "No snapshot. Use novaphysics save first." end
+                if hum and hum == snap.humanoid then
+                    pcall(function()
+                        hum.WalkSpeed = snap.walkSpeed
+                        hum.UseJumpPower = snap.useJumpPower
+                        hum.JumpPower = snap.jumpPower
+                        hum.JumpHeight = snap.jumpHeight
+                        hum.HipHeight = snap.hipHeight
+                    end)
+                end
+                workspace.Gravity = snap.gravity
+                if camera and camera == snap.camera and snap.fov then
+                    pcall(function() camera.FieldOfView = snap.fov end)
+                end
+                return "Restored snapshot for objects still present. Stop active movement commands first."
+            elseif action == "clear" then
+                V4.snapshots = nil
+                return "Local physics snapshot cleared."
+            end
+            return "Snapshot: " .. (V4.snapshots and "saved" or "none") .. " | novaphysics [save/restore/clear]"
+        end)
+
+    reg("novav4help", {"nhelix4"},
+        "Display this release's diagnostics and recovery commands.",
+        function()
+            return "HELIX v4: novapanic, novabudget, novaauditlive, novacmdinspect, novaphysics. Use F2 or Ctrl+K to open the organized palette."
+        end)
+    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
+    if type(IndexContents) == "function" then pcall(IndexContents, "", true) end
 end
