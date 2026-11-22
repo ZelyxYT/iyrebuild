@@ -2189,27 +2189,12 @@ end
 
 AllWaypoints = {}
 
--- NOVA: coalesce rapid saves by filename, never recursively spawn retry jobs.
-local pendingWrites = {}
-local flushingWrites = false
+-- Lightweight save helper for Infinite Yield settings and logs.
 function writefileCooldown(name, data)
-    if type(writefile) ~= "function" or type(name) ~= "string" then return end
-    pendingWrites[name] = data
-    if flushingWrites then return end
-    flushingWrites = true
+    if type(writefile) ~= "function" then return end
     task.spawn(function()
-        while next(pendingWrites) do
-            task.wait(0.4)
-            local batch = pendingWrites
-            pendingWrites = {}
-            for path, payload in pairs(batch) do
-                local ok, wrote = pcall(writefile, path, payload, true)
-                if (not ok or wrote == false) and _G.IY_DEBUG then
-                    warn("IY settings write failed:", path)
-                end
-            end
-        end
-        flushingWrites = false
+        task.wait(0.4)
+        pcall(writefile, name, data)
     end)
 end
 
@@ -3247,50 +3232,34 @@ function cmdbarHolder()
 	end
 end
 
--- NOVA: one active close listener and one active pin listener per notification.
-pinNotification = nil
-local notificationCounter = 0
-local notificationCloseConnection = nil
-function notify(text, text2, length)
-    notificationCounter = notificationCounter + 1
-    local notificationId = notificationCounter
-    if pinNotification then pinNotification:Disconnect() pinNotification = nil end
-    if notificationCloseConnection then
-        notificationCloseConnection:Disconnect()
-        notificationCloseConnection = nil
-    end
-    local pinned = false
-    local closed = false
-    Title_2.Text = tostring(text2 and text or "Notification")
-    Text_2.Text = tostring(text2 or text or "")
+-- Basic Infinite Yield notification panel.
+local notificationVersion = 0
+function notify(title, message, length)
+    notificationVersion = notificationVersion + 1
+    local version = notificationVersion
+    Title_2.Text = tostring(message and title or "Notification")
+    Text_2.Text = tostring(message or title or "")
     PinImage.ImageTransparency = 0
-    pinNotification = PinButton.MouseButton1Click:Connect(function()
-        if notificationId ~= notificationCounter then return end
+    local pinned = false
+    local pinConnection, closeConnection
+    pinConnection = PinButton.MouseButton1Click:Connect(function()
         pinned = not pinned
         PinImage.ImageTransparency = pinned and 0.5 or 0
     end)
-    notificationCloseConnection = CloseButton.MouseButton1Click:Connect(function()
-        if notificationId ~= notificationCounter then return end
-        closed = true
-        Notification:TweenPosition(
-            UDim2.new(1, Notification.Position.X.Offset, 1, 0),
-            "InOut", "Quart", 0.25, true
-        )
-    end)
-    Notification:TweenPosition(
-        UDim2.new(1, Notification.Position.X.Offset, 1, -100),
-        "InOut", "Quart", 0.25, true
-    )
-    task.spawn(function()
-        local duration = tonumber(length) or 10
-        if duration ~= duration then duration = 10 end
-        task.wait(math.clamp(duration, 0.5, 120))
-        if notificationId == notificationCounter and not pinned and not closed then
-            Notification:TweenPosition(
-                UDim2.new(1, Notification.Position.X.Offset, 1, 0),
-                "InOut", "Quart", 0.25, true
-            )
+    closeConnection = CloseButton.MouseButton1Click:Connect(function()
+        if version == notificationVersion then
+            notificationVersion = notificationVersion + 1
+            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", .25, true)
         end
+    end)
+    Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, -100), "InOut", "Quart", .25, true)
+    task.spawn(function()
+        task.wait(tonumber(length) or 10)
+        if version == notificationVersion and not pinned then
+            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", .25, true)
+        end
+        if pinConnection then pinConnection:Disconnect() end
+        if closeConnection then closeConnection:Disconnect() end
     end)
 end
 
@@ -5107,393 +5076,118 @@ function getstring(begin, args)
     return table.concat(args or cargs, " ", begin)
 end
 
--- NOVA v2: indexed canonical names and aliases. Rebuild lazily on mutation,
--- and keep custom aliases as a final fallback for backward compatibility.
-local novaIndex, novaIndexedSize = {}, -1
-local function invalidateCommandIndex()
-    novaIndexedSize = -1
-end
-findCmd = function(cmd_name)
-    if type(cmd_name) ~= "string" or cmd_name == "" then return nil end
-    local key = cmd_name:lower()
-    if novaIndexedSize ~= #cmds then
-        local rebuilt = {}
-        for _, command in ipairs(cmds) do
-            if type(command.NAME) == "string" then
-                local canonical = command.NAME:lower()
-                if rebuilt[canonical] == nil then rebuilt[canonical] = command end
-                for _, alias in ipairs(type(command.ALIAS) == "table" and command.ALIAS or {}) do
-                    local candidate = tostring(alias):lower()
-                    if rebuilt[candidate] == nil then rebuilt[candidate] = command end
-                end
-            end
+-- Standard Infinite Yield command registry and dispatcher.
+findCmd = function(name)
+    if type(name) ~= "string" then return nil end
+    local query = name:lower()
+    for _, command in ipairs(cmds) do
+        if command.NAME:lower() == query then return command end
+        for _, alias in ipairs(command.ALIAS or {}) do
+            if alias:lower() == query then return command end
         end
-        novaIndex, novaIndexedSize = rebuilt, #cmds
     end
-    return novaIndex[key] or (type(customAlias) == "table" and customAlias[key] or nil)
+    if type(customAlias) == "table" then return customAlias[query] end
+    return nil
 end
 
-function splitString(str,delim)
-	local broken = {}
-	if delim == nil then delim = "," end
-	for w in string.gmatch(str,"[^"..delim.."]+") do
-		table.insert(broken,w)
-	end
-	return broken
+function splitString(str, delim)
+    local broken = {}
+    if delim == nil then delim = "," end
+    for item in string.gmatch(str, "[^" .. delim .. "]+") do
+        broken[#broken + 1] = item
+    end
+    return broken
 end
 
 cmdHistory = {}
 local lastCmds = {}
-local historyCount = 0
-local split=" "
 local lastBreakTime = 0
-local function recordCommandError(commandName, failure)
-    local history = _G.IY_NOVA_ERRORS
-    if type(history) ~= "table" then
-        history = {}
-        _G.IY_NOVA_ERRORS = history
-    end
-    table.insert(history, 1, {
-        command = tostring(commandName),
-        message = tostring(failure),
-        timestamp = os.time()
-    })
-    if #history > 40 then table.remove(history) end
-end
 
--- NOVA v2 dispatcher: bounded chains, tracked infinite loops, isolated errors,
--- no busy spins, and deterministic history entries. Existing signatures kept.
-local novaInfiniteLoops = {}
-local novaDispatch = {
-    infinite = novaInfiniteLoops, executed = 0, blocked = 0,
-    active = 0, maxActive = 10, maxLoops = 10,
-    launched = 0, completed = 0, failures = 0, cancelled = 0,
-    generation = 0, maxBatchCalls = 1600, budgetStops = 0,
-    startedAt = os.clock()
-}
-_G.IY_NOVA_DISPATCH = novaDispatch
-
--- Quoted arguments preserve names such as: novabeacon "Golden Orb".
--- Escaped quotes are supported inside quoted text.
-local function novaWords(raw)
-    local words, current, quoted, occupied = {}, {}, nil, false
-    local i, n = 1, #raw
-    while i <= n do
-        local ch = raw:sub(i, i)
-        if quoted then
-            if ch == quoted then
-                quoted = nil
-            elseif ch == "\\" and raw:sub(i + 1, i + 1) == quoted then
-                i = i + 1
-                current[#current + 1] = raw:sub(i, i)
-            else
-                current[#current + 1] = ch
+-- The original chaining and repeat syntax are retained. Every command is
+-- registered through addcmd, without additional command packs or dispatch hooks.
+function execCmd(input, speaker, store)
+    if input == nil then return end
+    local text = tostring(input)
+    if text == "" then return end
+    local actor = speaker or Players.LocalPlayer
+    local segments = splitString(text, "\\")
+    for _, segment in ipairs(segments) do
+        segment = segment:match("^%s*(.-)%s*$")
+        if segment ~= "" then
+            local count, interval, repeating = 1, 0, false
+            local prefix, remainder = segment:match("^(%d+)%^(.*)$")
+            if prefix then
+                count = tonumber(prefix) or 1
+                segment = remainder
+                local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
+                if seconds then interval, segment = tonumber(seconds) or 0, rest end
+            elseif segment:sub(1, 4):lower() == "inf^" then
+                repeating = true
+                segment = segment:sub(5)
+                local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
+                if seconds then interval, segment = tonumber(seconds) or 0.1, rest
+                else interval = 0.1 end
             end
-        elseif (ch == '"' or ch == "'") and not occupied then
-            quoted = ch
-            occupied = true
-        elseif ch:match("%s") then
-            if occupied then
-                words[#words + 1] = table.concat(current)
-                current, occupied = {}, false
+            if segment:sub(1, 1) == "!" then
+                local shortcut = segment:sub(2):match("^(%S+)")
+                if shortcut then segment = lastCmds[shortcut:lower()] or segment end
             end
-        else
-            current[#current + 1] = ch
-            occupied = true
-        end
-        i = i + 1
-    end
-    if occupied then words[#words + 1] = table.concat(current) end
-    return words
-end
-
-local function novaSegments(raw)
-    local segments, piece, quote = {}, {}, nil
-    local i = 1
-    while i <= #raw do
-        local ch = raw:sub(i, i)
-        if quote then
-            piece[#piece + 1] = ch
-            if ch == quote and raw:sub(i - 1, i - 1) ~= "\\" then quote = nil end
-        elseif ch == '"' or ch == "'" then
-            quote = ch
-            piece[#piece + 1] = ch
-        elseif ch == "\\" then
-            if raw:sub(i + 1, i + 1) == "\\" then
-                piece[#piece + 1] = "\\"
-                i = i + 1
-            else
-                segments[#segments + 1] = table.concat(piece)
-                piece = {}
-            end
-        else
-            piece[#piece + 1] = ch
-        end
-        i = i + 1
-    end
-    segments[#segments + 1] = table.concat(piece)
-    return segments
-end
-
-local function novaLoopCount()
-    local count = 0
-    for _ in pairs(novaInfiniteLoops) do count = count + 1 end
-    return count
-end
-novaDispatch.loopCount = novaLoopCount
-novaDispatch.stopLoop = function(input)
-    local key = tostring(input or ""):lower()
-    local cmd = findCmd(key)
-    key = (cmd and cmd.NAME or key):lower()
-    if not novaInfiniteLoops[key] then return false end
-    novaInfiniteLoops[key] = nil
-    novaDispatch.cancelled = novaDispatch.cancelled + 1
-    return true
-end
-novaDispatch.stopAll = function()
-    novaDispatch.generation = novaDispatch.generation + 1
-    lastBreakTime = tick()
-    local n = 0
-    for name in pairs(novaInfiniteLoops) do
-        novaInfiniteLoops[name] = nil
-        n = n + 1
-    end
-    novaDispatch.cancelled = novaDispatch.cancelled + n
-    return n
-end
-
-local function novaInvoke(command, args, actor, requested, index, total, infinite)
-    -- Legacy callbacks may read cargs. The argument table remains local to
-    -- every invocation, while only legacy compatibility uses the global.
-    cargs = args
-    local ok, result = pcall(command.FUNC, args, actor)
-    novaDispatch.executed = novaDispatch.executed + 1
-    if not ok then
-        novaDispatch.failures = novaDispatch.failures + 1
-        -- The instrumented wrapper has already logged a detailed failure.
-        if not tostring(result):find("^%[NOVA:") then
-            recordCommandError(requested, result)
-        end
-        if _G.IY_DEBUG then warn("NOVA command failed:", requested, result) end
-        return false
-    end
-    if type(result) == "string" and not infinite and (index == 1 or index == total)
-        and not table.find(args, "nonotify") then
-        notify("Command: " .. requested, result)
-    end
-    return true
-end
-
-local function novaExecuteSegment(piece, actor, originalInput, saveHistory, guard)
-    local repetitions, seconds, infinite = 1, 0, false
-    local prefix, after = piece:match("^(%d+)%^(.*)$")
-    if prefix then
-        repetitions = math.clamp(tonumber(prefix) or 1, 1, 1000)
-        piece = after
-        local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
-        if waitValue then seconds, piece = tonumber(waitValue) or 0, rest end
-    elseif piece:sub(1, 4):lower() == "inf^" then
-        infinite = true
-        piece = piece:sub(5)
-        local waitValue, rest = piece:match("^([%d%.]+)%^(.*)$")
-        if waitValue then seconds, piece = tonumber(waitValue) or 0.1, rest
-        else seconds = 0.1 end
-        seconds = math.clamp(seconds, 0.05, 60)
-    end
-    repetitions = math.floor(repetitions)
-    seconds = math.clamp(seconds, 0, 60)
-    if piece:sub(1, 1) == "!" then
-        local shortcut = novaWords(piece:sub(2))[1]
-        if shortcut and lastCmds[shortcut:lower()] then piece = lastCmds[shortcut:lower()] end
-    end
-    local args = novaWords(piece)
-    local requested = args[1] and args[1]:lower()
-    if not requested then return end
-    local command = findCmd(requested)
-    if not command or type(command.FUNC) ~= "function" then
-        recordCommandError(requested, "Unknown command")
-        return
-    end
-    table.remove(args, 1)
-    if saveHistory and actor == Players.LocalPlayer then
-        if cmdHistory[1] ~= originalInput and requested ~= "lastcommand" and requested ~= "lastcmd" then
-            table.insert(cmdHistory, 1, originalInput)
-            if #cmdHistory > 30 then table.remove(cmdHistory) end
-        end
-        lastCmds[requested] = piece
-    end
-    local began = tick()
-    if guard and guard.generation ~= novaDispatch.generation then return end
-    if infinite then
-        local key = command.NAME:lower()
-        if not novaInfiniteLoops[key] and novaLoopCount() >= novaDispatch.maxLoops then
-            novaDispatch.blocked = novaDispatch.blocked + 1
-            recordCommandError(requested, "Maximum concurrent repeating commands reached")
-            return
-        end
-        local marker = {name = key, interval = seconds, started = os.clock(), count = 0}
-        novaInfiniteLoops[key] = marker -- cancels the old copy, if any
-        task.spawn(function()
-            local failures = 0
-            while novaInfiniteLoops[key] == marker and lastBreakTime <= began
-                and (not guard or guard.generation == novaDispatch.generation) do
-                marker.count = marker.count + 1
-                if novaInvoke(command, args, actor, requested, marker.count, math.huge, true) then
-                    failures = 0
-                else
-                    failures = failures + 1
-                    if failures >= 3 then
-                        recordCommandError(key, "Repeating command stopped after three failures")
-                        break
+            local words = {}
+            for word in segment:gmatch("%S+") do words[#words + 1] = word end
+            local commandName = words[1] and words[1]:lower()
+            local command = commandName and findCmd(commandName)
+            if command then
+                table.remove(words, 1)
+                if store and actor == Players.LocalPlayer then
+                    if cmdHistory[1] ~= text then
+                        table.insert(cmdHistory, 1, text)
+                        if #cmdHistory > 30 then table.remove(cmdHistory) end
                     end
+                    lastCmds[commandName] = segment
                 end
-                task.wait(seconds)
+                local epoch = lastBreakTime
+                task.spawn(function()
+                    local runs = 0
+                    repeat
+                        if lastBreakTime ~= epoch then break end
+                        runs = runs + 1
+                        cargs = words -- legacy Infinite Yield commands rely on cargs
+                        local ok, result = pcall(command.FUNC, words, actor)
+                        if not ok then
+                            warn("[Infinite Yield] Command error: " .. tostring(result))
+                            break
+                        end
+                        if type(result) == "string" and not table.find(words, "nonotify") and not repeating then
+                            notify("Command: " .. commandName, result)
+                        end
+                        if repeating or runs < count then task.wait(math.max(interval, 0.01)) end
+                    until (not repeating and runs >= count)
+                end)
             end
-            if novaInfiniteLoops[key] == marker then novaInfiniteLoops[key] = nil end
-        end)
-        return -- continue other chained commands; infinite tasks no longer block the chain
-    end
-    local failures = 0
-    for i = 1, repetitions do
-        if lastBreakTime > began or (guard and guard.generation ~= novaDispatch.generation) then break end
-        if guard then
-            if guard.remaining <= 0 then
-                novaDispatch.budgetStops = novaDispatch.budgetStops + 1
-                recordCommandError("dispatcher", "Batch execution budget reached; remaining calls cancelled")
-                break
-            end
-            guard.remaining = guard.remaining - 1
         end
-        if novaInvoke(command, args, actor, requested, i, repetitions, false) then
-            failures = 0
-        else
-            failures = failures + 1
-            if failures >= 3 then break end
-        end
-        if seconds > 0 then task.wait(seconds)
-        elseif i % 15 == 0 then task.wait() end
     end
-end
-
-function execCmd(cmdStr, speaker, store)
-    if cmdStr == nil then return end
-    cmdStr = tostring(cmdStr):gsub("^%s+", ""):gsub("%s+$", "")
-    if cmdStr == "" then return end
-    if #cmdStr > 4096 then
-        recordCommandError("dispatcher", "Input exceeds 4096 characters")
-        novaDispatch.blocked = novaDispatch.blocked + 1
-        return
-    end
-    local segments = novaSegments(cmdStr)
-    if #segments > 40 then
-        recordCommandError("dispatcher", "Maximum of 40 chained commands")
-        novaDispatch.blocked = novaDispatch.blocked + 1
-        return
-    end
-    if novaDispatch.active >= novaDispatch.maxActive then
-        recordCommandError("dispatcher", "Too many active command batches; try again shortly")
-        novaDispatch.blocked = novaDispatch.blocked + 1
-        return
-    end
-    novaDispatch.active = novaDispatch.active + 1
-    novaDispatch.launched = novaDispatch.launched + 1
-    local guard = {generation = novaDispatch.generation, remaining = novaDispatch.maxBatchCalls}
-    task.spawn(function()
-        local ok, err = pcall(function()
-            local actor = speaker or Players.LocalPlayer
-            for _, raw in ipairs(segments) do
-                if guard.generation ~= novaDispatch.generation or guard.remaining <= 0 then break end
-                local segment = raw:gsub("^%s+", ""):gsub("%s+$", "")
-                if segment ~= "" then novaExecuteSegment(segment, actor, cmdStr, store, guard) end
-            end
-        end)
-        novaDispatch.active = math.max(0, novaDispatch.active - 1)
-        novaDispatch.completed = novaDispatch.completed + 1
-        if not ok then
-            novaDispatch.failures = novaDispatch.failures + 1
-            recordCommandError("dispatcher", err)
-        end
-    end)
 end
 
 function addcmd(name, alias, func, plgn)
-    if type(name) ~= "string" or name == "" or type(func) ~= "function" then
-        if _G.IY_DEBUG then warn("Rejected invalid command:", tostring(name)) end
-        return nil
-    end
-    local existing = findCmd(name)
-    if existing then
-        if _G.IY_DEBUG then warn("Skipped ambiguous command registration:", name,
-            "already owned by", existing.NAME) end
-        return existing
-    end
-    local cleanAliases, used = {}, {}
-    for _, raw in ipairs(type(alias) == "table" and alias or {}) do
-        if type(raw) == "string" then
-            local key = raw:lower():match("^%s*(.-)%s*$")
-            if key ~= "" and key ~= name:lower() and not used[key] then
-                used[key] = true
-                if not findCmd(key) then
-                    cleanAliases[#cleanAliases + 1] = raw
-                else
-                    _G.IY_NOVA_ALIAS_CONFLICTS = _G.IY_NOVA_ALIAS_CONFLICTS or {}
-                    if #_G.IY_NOVA_ALIAS_CONFLICTS < 100 then
-                        table.insert(_G.IY_NOVA_ALIAS_CONFLICTS, name .. ": " .. raw)
-                    end
-                end
-            end
-        end
-    end
-    local cmd = {NAME = name, ALIAS = cleanAliases, FUNC = func, PLUGIN = plgn}
-    cmds[#cmds + 1] = cmd
-    invalidateCommandIndex()
-    local hook = _G.IY_NOVA_REBUILD_HOOK
-    if type(hook) == "function" then pcall(hook, cmd) end
-    return cmd
+    local command = {NAME = name, ALIAS = alias or {}, FUNC = func, PLUGIN = plgn}
+    cmds[#cmds + 1] = command
+    return command
 end
 
-function removecmd(cmd)
-    if type(cmd) ~= "string" then return false end
-    local input = cmd:lower():match("^%s*(.-)%s*$")
-    if input == "" then return false end
-    local found = findCmd(input)
-    if not found then return false end
-    local canonical = tostring(found.NAME):lower()
-    local removed = false
-    for i = #cmds, 1, -1 do
-        if cmds[i] == found then
-            table.remove(cmds, i)
-            removed = true
+function removecmd(name)
+    local command = findCmd(name)
+    if not command then return end
+    for index = #cmds, 1, -1 do
+        if cmds[index] == command then
+            table.remove(cmds, index)
             break
         end
     end
-    if not removed then return false end
-    invalidateCommandIndex()
-    for _, item in ipairs(CMDsF:GetChildren()) do
-        if item:IsA("TextButton") then
-            local label = tostring(item:GetAttribute("Title") or item.Text):lower()
-            local first = label:match("^%s*([%w_]+)")
-            if first == canonical then
-                item.TextTransparency = 0.65
-                if not item:GetAttribute("NOVA_RemovedNotice") then
-                    item:SetAttribute("NOVA_RemovedNotice", true)
-                    item.MouseButton1Click:Connect(function()
-                        notify("Command disabled", "This command was removed from the registry.")
-                    end)
-                end
-            end
-        end
-    end
-    return true
 end
 
-function overridecmd(name, func)
+function overridecmd(name, callback)
     local command = findCmd(name)
-    if command and type(func) == "function" then
-        command.FUNC = func
-        local hook = _G.IY_NOVA_REBUILD_HOOK
-        if type(hook) == "function" then pcall(hook, command) end
-    end
+    if command then command.FUNC = callback end
 end
 
 function addbind(cmd,key,iskeyup,toggle)
@@ -10863,180 +10557,626 @@ addcmd('oldconsole',{},function(args, speaker)
 	notify('Console','Press F9 to open the console')
 end)
 
--- NOVA Dex++ right-click remote repeater: optional arguments per remote and per-remote stop.
--- This patches Dex++'s real Explorer context menu before loading it, without modifying
--- its upstream scripts or intercepting unrelated game traffic.
-local NOVA_DEX_URL = "https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua"
-local NOVA_DEX_MENU_MARKER = 'if presentClasses["RemoteEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end'
-local NOVA_DEX_REG_MARKER = 'Explorer.RightClickContext = context'
-
-local NOVA_DEX_MENU_INSERT = [==[
-		-- NOVA: show actions only for one selected client-to-server remote.
-		if #sList == 1 and (presentClasses["RemoteEvent"] or presentClasses["RemoteFunction"] or presentClasses["UnreliableRemoteEvent"]) then
-			context:AddRegistered("NOVA_REPEAT_START")
-			context:AddRegistered("NOVA_REPEAT_STOP")
-		end
-
-]==]
-
-local NOVA_DEX_REG_INSERT = [==[
-		-- NOVA remote repeater. Keep its state across Dex windows and repeated loads.
-		local novaGlobal = (type(getgenv) == "function" and getgenv()) or _G
-		local novaState = novaGlobal.NOVA_DexRemoteRepeater
-		if type(novaState) ~= "table" then
-			novaState = {
-				loops = setmetatable({}, {__mode = "k"}),
-				args = setmetatable({}, {__mode = "k"}),
-			}
-			novaGlobal.NOVA_DexRemoteRepeater = novaState
-		end
-		novaState.loops = novaState.loops or setmetatable({}, {__mode = "k"})
-		novaState.args = novaState.args or setmetatable({}, {__mode = "k"})
-
-		local function novaSelectedRemote()
-			local entries = selection.List
-			if #entries ~= 1 then return nil end
-			local remote = entries[1].Obj
-			if not remote then return nil end
-			if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent") then
-				return remote
-			end
-			return nil
-		end
-
-		local function novaNotice(message)
-			pcall(function()
-				game:GetService("StarterGui"):SetCore("SendNotification", {
-					Title = "NOVA Dex++",
-					Text = message,
-					Duration = 4,
-				})
-			end)
-		end
-
-		context:Register("NOVA_REPEAT_START", {
-			Name = "NOVA: Start Auto Fire (0.01s)",
-			IconMap = Explorer.MiscIcons,
-			Icon = "Play",
-			OnClick = function()
-				local remote = novaSelectedRemote()
-				if not remote then return end
-				local existing = novaState.loops[remote]
-				if existing and existing.running then
-					novaNotice("Already running: " .. remote.Name)
-					return
-				end
-				local job = {running = true, sent = 0, errors = 0}
-				novaState.loops[remote] = job
-				novaNotice("Started: " .. remote.Name .. " (0.01s)")
-
-				task.spawn(function()
-					local isFunction = remote:IsA("RemoteFunction")
-					while job.running and remote.Parent ~= nil do
-						-- Default to no arguments. For remotes expecting args, set
-						-- getgenv().NOVA_DexRemoteRepeater.args[remote] = table.pack(...)
-						local savedArgs = novaState.args[remote]
-						local params = type(savedArgs) == "table" and savedArgs or {}
-						local count = type(params.n) == "number" and params.n or #params
-						local ok, err = pcall(function()
-							if isFunction then
-								remote:InvokeServer(table.unpack(params, 1, count))
-							else
-								remote:FireServer(table.unpack(params, 1, count))
-							end
-						end)
-						if ok then
-							job.sent = job.sent + 1
-							job.errors = 0
-						else
-							job.errors = job.errors + 1
-							if job.errors >= 3 then
-								warn("[NOVA Dex] Repeater stopped for " .. remote.Name .. ": " .. tostring(err))
-								novaNotice("Stopped after errors: " .. remote.Name)
-								break
-							end
-						end
-						-- Requested minimum interval; frame rate/network/server may limit rate.
-						task.wait(0.01)
-					end
-					job.running = false
-					if novaState.loops[remote] == job then
-						novaState.loops[remote] = nil
-					end
-				end)
-			end,
-		})
-
-		context:Register("NOVA_REPEAT_STOP", {
-			Name = "NOVA: Stop Auto Fire",
-			IconMap = Explorer.MiscIcons,
-			Icon = "Pause",
-			OnClick = function()
-				local remote = novaSelectedRemote()
-				if not remote then return end
-				local job = novaState.loops[remote]
-				if job and job.running then
-					job.running = false
-					novaNotice("Stopping: " .. remote.Name)
-				else
-					novaNotice("Not running: " .. remote.Name)
-				end
-			end,
-		})
-
-]==]
-
-local function novaDexInsertBefore(sourceText, marker, injection)
-    local at = string.find(sourceText, marker, 1, true)
-    if not at then return nil end
-    return string.sub(sourceText, 1, at - 1) .. injection .. string.sub(sourceText, at)
-end
-
-local function novaPatchDex(sourceText)
-    if type(sourceText) ~= "string" or #sourceText < 1000 then
-        return nil, "Dex++ download was empty or invalid"
+-- Infinite Yield Classic | Dex Remote Studio v2
+-- Classic Infinite Yield only. All remote actions are client-initiated.
+local function iyCreateDexStudio()
+    local dexEnv = (type(getgenv) == "function" and getgenv()) or _G
+    local previous = dexEnv.IY_DexRemoteStudio
+    if type(previous) == "table" and type(previous.Destroy) == "function" then
+        pcall(function() previous:Destroy() end)
     end
-    if string.find(sourceText, "NOVA_REPEAT_START", 1, true) then
-        return sourceText -- Already patched.
-    end
-    local patched = novaDexInsertBefore(sourceText, NOVA_DEX_MENU_MARKER, NOVA_DEX_MENU_INSERT)
-    if not patched then
-        return nil, "Dex++ Explorer menu layout has changed"
-    end
-    patched = novaDexInsertBefore(patched, NOVA_DEX_REG_MARKER, NOVA_DEX_REG_INSERT)
-    if not patched then
-        return nil, "Dex++ Explorer registration layout has changed"
-    end
-    return patched
-end
 
-addcmd("explorer", {"dex"}, function(args, speaker)
-    notify("Loading", "Loading Dex++ with NOVA remote actions")
-    local downloaded, sourceOrError = pcall(function()
-        return game:HttpGet(NOVA_DEX_URL)
+    local Studio = {
+        selected = nil,
+        jobs = setmetatable({}, {__mode = "k"}),
+        configs = setmetatable({}, {__mode = "k"}),
+        messages = {},
+        totals = {sent = 0, failed = 0},
+        maxActive = 3,
+        destroyed = false,
+        gui = nil,
+        refs = {},
+        connections = {},
+    }
+    dexEnv.IY_DexRemoteStudio = Studio
+
+    local Players = game:GetService("Players")
+    local Input = game:GetService("UserInputService")
+    local Http = game:GetService("HttpService")
+
+    local function remoteOK(remote)
+        if typeof(remote) ~= "Instance" then return false end
+        local ok, valid = pcall(function()
+            return (remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") or remote:IsA("RemoteFunction"))
+                and remote:IsDescendantOf(game)
+        end)
+        return ok and valid
+    end
+    function Studio:IsRemote(remote) return remoteOK(remote) end
+
+    local function fullPath(remote)
+        if not remoteOK(remote) then return "No remote selected" end
+        local success, path = pcall(function() return remote:GetFullName() end)
+        return success and path or remote.Name
+    end
+
+    local function configFor(remote)
+        local conf = Studio.configs[remote]
+        if not conf then
+            conf = {interval = 0.01, argsText = "[]"}
+            Studio.configs[remote] = conf
+        end
+        return conf
+    end
+
+    function Studio:Log(message, severity)
+        if self.destroyed then return end
+        table.insert(self.messages, 1, {
+            text = os.date("%H:%M:%S") .. "  " .. tostring(message),
+            severity = severity or "info",
+        })
+        while #self.messages > 35 do table.remove(self.messages) end
+        self:RenderLog()
+    end
+
+    local function parseArgValue(value, depth)
+        if depth > 7 then error("Arguments nested too deeply") end
+        if type(value) ~= "table" then return value end
+        local tag = rawget(value, "$type")
+        if tag == "nil" then return nil end
+        if tag == "Vector3" then
+            local x, y, z = tonumber(value.x), tonumber(value.y), tonumber(value.z)
+            assert(x and y and z, "Vector3 requires x, y and z")
+            return Vector3.new(x, y, z)
+        end
+        if tag == "Color3" then
+            local r, g, b = tonumber(value.r), tonumber(value.g), tonumber(value.b)
+            assert(r and g and b, "Color3 requires r, g and b (0-1)")
+            return Color3.new(r, g, b)
+        end
+        if tag == "CFrame" then
+            local x, y, z = tonumber(value.x), tonumber(value.y), tonumber(value.z)
+            assert(x and y and z, "CFrame requires x, y and z")
+            return CFrame.new(x, y, z)
+        end
+        if tag ~= nil then error("Unknown typed argument: " .. tostring(tag)) end
+        local result = {}
+        for key, child in pairs(value) do
+            result[key] = parseArgValue(child, depth + 1)
+        end
+        return result
+    end
+
+    function Studio:ParseArgs(text)
+        text = (type(text) == "string" and text ~= "") and text or "[]"
+        if #text > 8192 then return nil, "Arguments exceed 8192 characters" end
+        if not string.match(text, "^%s*%[") then
+            return nil, "Arguments must begin with [ and end with ]"
+        end
+        local ok, decoded = pcall(function() return Http:JSONDecode(text) end)
+        if not ok or type(decoded) ~= "table" then
+            return nil, "Arguments must be a JSON array, for example [1, true, \"hello\"]"
+        end
+        -- A JSON object is not a positional argument list.
+        for key in pairs(decoded) do
+            if type(key) ~= "number" or key < 1 or key > 24 or key % 1 ~= 0 then
+                return nil, "Use a JSON array with at most 24 arguments"
+            end
+        end
+        local count = #decoded
+        if count > 24 then return nil, "Maximum 24 arguments" end
+        local values = {n = count}
+        local converted, err = pcall(function()
+            for i = 1, count do values[i] = parseArgValue(decoded[i], 0) end
+        end)
+        if not converted then return nil, tostring(err) end
+        return values
+    end
+
+    function Studio:CommitConfig(remote)
+        if not remoteOK(remote) then return nil, "Select a remote in Dex first" end
+        local cfg = configFor(remote)
+        if self.selected == remote and self.refs.interval then
+            local n = tonumber(self.refs.interval.Text)
+            if not n or n ~= n or n < 0.01 or n > 5 then
+                return nil, "Interval must be between 0.01 and 5 seconds"
+            end
+            cfg.interval = n
+            cfg.argsText = self.refs.args.Text
+        end
+        local parsed, err = self:ParseArgs(cfg.argsText)
+        if not parsed then return nil, err end
+        return {interval = cfg.interval, args = parsed}
+    end
+
+    function Studio:Select(remote, showPanel)
+        if not remoteOK(remote) then
+            self:Log("That object is not a usable client-to-server remote", "error")
+            return false
+        end
+        local changed = (self.selected ~= remote)
+        if changed and remoteOK(self.selected) and self.refs.interval then
+            -- Preserve edits when switching between remotes in the Explorer.
+            local old = configFor(self.selected)
+            local n = tonumber(self.refs.interval.Text)
+            if n and n == n and n >= 0.01 and n <= 5 then old.interval = n end
+            old.argsText = self.refs.args.Text
+        end
+        self.selected = remote
+        self:Refresh(changed)
+        if showPanel then self:Show() end
+        return true
+    end
+
+    local function callRemote(remote, params)
+        if remote:IsA("RemoteFunction") then
+            return remote:InvokeServer(table.unpack(params, 1, params.n))
+        else
+            return remote:FireServer(table.unpack(params, 1, params.n))
+        end
+    end
+
+    function Studio:FireOnce(remote)
+        if not remoteOK(remote) then self:Log("Select a valid remote", "error") return false end
+        local cfg, err = self:CommitConfig(remote)
+        if not cfg then self:Log(err, "error") return false end
+        task.spawn(function()
+            local ok, result = pcall(callRemote, remote, cfg.args)
+            if self.destroyed then return end
+            if ok then
+                self.totals.sent = self.totals.sent + 1
+                self:Log("Sent once: " .. remote.Name, "success")
+            else
+                self.totals.failed = self.totals.failed + 1
+                self:Log(remote.Name .. ": " .. tostring(result), "error")
+            end
+        end)
+        return true
+    end
+
+    function Studio:ActiveCount()
+        local count = 0
+        for _, job in pairs(self.jobs) do
+            if job.running then count = count + 1 end
+        end
+        return count
+    end
+
+    function Studio:Start(remote)
+        if not remoteOK(remote) then self:Log("Select a valid remote", "error") return false end
+        local existing = self.jobs[remote]
+        if existing and not existing.finished then
+            self:Log("Already running or awaiting a server reply: " .. remote.Name)
+            return false
+        end
+        if self:ActiveCount() >= self.maxActive then
+            self:Log("At most " .. self.maxActive .. " simultaneous loops are allowed", "error")
+            return false
+        end
+        local cfg, err = self:CommitConfig(remote)
+        if not cfg then self:Log(err, "error") return false end
+        local job = {running = true, finished = false, sent = 0, failed = 0, interval = cfg.interval}
+        self.jobs[remote] = job
+        self:Log("Started " .. remote.Name .. " every " .. tostring(cfg.interval) .. "s", "success")
+        task.spawn(function()
+            while job.running and not self.destroyed and remoteOK(remote) do
+                -- One call at a time, including yielding RemoteFunctions. No task pileups.
+                local ok, result = pcall(callRemote, remote, cfg.args)
+                if ok then
+                    job.sent = job.sent + 1
+                    job.consecutiveErrors = 0
+                    self.totals.sent = self.totals.sent + 1
+                else
+                    job.failed = job.failed + 1
+                    self.totals.failed = self.totals.failed + 1
+                    job.consecutiveErrors = (job.consecutiveErrors or 0) + 1
+                    job.lastError = tostring(result)
+                    if job.consecutiveErrors >= 3 then
+                        self:Log("Stopped " .. remote.Name .. " after 3 consecutive errors", "error")
+                        break
+                    end
+                end
+                if job.running then task.wait(job.interval) end
+            end
+            job.running = false
+            job.finished = true
+            if self.jobs[remote] == job then self.jobs[remote] = nil end
+        end)
+        self:Refresh()
+        return true
+    end
+
+    function Studio:Stop(remote)
+        local job = self.jobs[remote]
+        if not job or not job.running then
+            self:Log("No active loop for selected remote")
+            return false
+        end
+        job.running = false
+        self:Log("Stopping " .. remote.Name)
+        self:Refresh()
+        return true
+    end
+
+    function Studio:StopAll()
+        local stopped = 0
+        for _, job in pairs(self.jobs) do
+            if job.running then job.running = false stopped = stopped + 1 end
+        end
+        if stopped > 0 then self:Log("Stopped " .. stopped .. " remote loop(s)") end
+        self:Refresh()
+        return stopped
+    end
+
+    function Studio:CopyPath(remote)
+        if not remoteOK(remote) then self:Log("Select a remote first", "error") return end
+        local clip = setclipboard or toclipboard
+        if type(clip) ~= "function" then self:Log("Clipboard is not supported", "error") return end
+        local ok = pcall(clip, fullPath(remote))
+        self:Log(ok and "Remote path copied" or "Could not copy path", ok and "success" or "error")
+    end
+
+    local C = {
+        bg = Color3.fromRGB(16, 20, 30), panel = Color3.fromRGB(23, 29, 42),
+        field = Color3.fromRGB(32, 39, 55), edge = Color3.fromRGB(54, 66, 85),
+        accent = Color3.fromRGB(70, 157, 255), text = Color3.fromRGB(237, 244, 255),
+        muted = Color3.fromRGB(155, 173, 198), green = Color3.fromRGB(76, 203, 153),
+        red = Color3.fromRGB(244, 100, 116),
+    }
+    local function newObj(class, parent, props)
+        local obj = Instance.new(class)
+        for prop, val in pairs(props or {}) do obj[prop] = val end
+        obj.Parent = parent
+        return obj
+    end
+    local function rounded(obj, r)
+        newObj("UICorner", obj, {CornerRadius = UDim.new(0, r or 8)})
+        return obj
+    end
+    local function outline(obj)
+        newObj("UIStroke", obj, {Color = C.edge, Thickness = 1, Transparency = 0.5})
+    end
+    local function label(parent, title, pos, size, fontSize, color, bold)
+        return newObj("TextLabel", parent, {
+            BackgroundTransparency = 1, Position = pos, Size = size,
+            Text = title, Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+            TextSize = fontSize, TextColor3 = color or C.text,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+    end
+    local function button(parent, name, x, y, w, color, callback)
+        local b = rounded(newObj("TextButton", parent, {
+            Name = name, Size = UDim2.fromOffset(w, 35), Position = UDim2.fromOffset(x, y),
+            BorderSizePixel = 0, BackgroundColor3 = color,
+            Text = name, TextColor3 = C.text, TextSize = 12,
+            Font = Enum.Font.GothamBold, AutoButtonColor = true,
+        }), 8)
+        b.MouseButton1Click:Connect(callback)
+        return b
+    end
+    local function inputField(parent, placeholder, x, y, w, default)
+        local t = rounded(newObj("TextBox", parent, {
+            Name = placeholder, Size = UDim2.fromOffset(w, 42), Position = UDim2.fromOffset(x, y),
+            BackgroundColor3 = C.field, TextColor3 = C.text, PlaceholderColor3 = C.muted,
+            Text = default, PlaceholderText = placeholder, Font = Enum.Font.Code,
+            TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+            ClearTextOnFocus = false, BorderSizePixel = 0,
+        }), 7)
+        newObj("UIPadding", t, {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})
+        outline(t)
+        return t
+    end
+
+    function Studio:Build()
+        if self.destroyed then return end
+        if self.gui and self.gui.Parent then return end
+        local target = Players.LocalPlayer:WaitForChild("PlayerGui")
+        if type(gethui) == "function" then
+            local ok, guiParent = pcall(gethui)
+            if ok and typeof(guiParent) == "Instance" then target = guiParent end
+        end
+
+        local gui = newObj("ScreenGui", nil, {
+            Name = "IY_Dex_Remote_Studio", ResetOnSpawn = false,
+            IgnoreGuiInset = true, DisplayOrder = 932, Enabled = true,
+            ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        })
+        local parented = pcall(function() gui.Parent = target end)
+        if not parented then gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui") end
+        local panel = rounded(newObj("Frame", gui, {
+            Size = UDim2.fromOffset(590, 431), AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = C.bg,
+            BorderSizePixel = 0,
+        }), 12)
+        outline(panel)
+        local scale = newObj("UIScale", panel, {Scale = 1})
+        local camera = workspace.CurrentCamera
+        if camera then
+            local view = camera.ViewportSize
+            scale.Scale = math.min(1, math.max(0.65, math.min(view.X / 660, view.Y / 520)))
+        end
+        local header = rounded(newObj("Frame", panel, {
+            Name = "DragHandle", Size = UDim2.new(1, 0, 0, 54),
+            BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        }), 12)
+        newObj("Frame", header, {
+            Position = UDim2.new(0, 0, 1, -11), Size = UDim2.new(1, 0, 0, 11),
+            BorderSizePixel = 0, BackgroundColor3 = C.panel,
+        })
+        label(header, "DEX  /  REMOTE STUDIO", UDim2.fromOffset(19, 7), UDim2.fromOffset(390, 25), 17, C.text, true)
+        label(header, "INFINITE YIELD CLASSIC  |  F7 TO TOGGLE", UDim2.fromOffset(20, 31), UDim2.fromOffset(400, 16), 10, C.muted)
+        button(header, "-", 499, 10, 35, C.field, function()
+            self.refs.content.Visible = not self.refs.content.Visible
+            panel.Size = UDim2.fromOffset(590, self.refs.content.Visible and 431 or 54)
+        end)
+        button(header, "X", 542, 10, 35, C.field, function() self:Hide() end)
+
+        local content = newObj("Frame", panel, {
+            Name = "Content", Size = UDim2.new(1, 0, 1, -54), Position = UDim2.fromOffset(0, 54),
+            BackgroundTransparency = 1,
+        })
+        self.refs.content = content
+        label(content, "SELECTED REMOTE", UDim2.fromOffset(20, 12), UDim2.fromOffset(270, 18), 10, C.muted, true)
+        local selected = label(content, "No remote selected (right-click in Dex)", UDim2.fromOffset(20, 31), UDim2.fromOffset(550, 27), 16, C.text, true)
+        local path = label(content, "Use Dex Explorer to pick a RemoteEvent or RemoteFunction", UDim2.fromOffset(20, 59), UDim2.fromOffset(549, 20), 11, C.muted)
+        self.refs.selected = selected
+        self.refs.path = path
+
+        label(content, "INTERVAL IN SECONDS  (0.01-5)", UDim2.fromOffset(20, 93), UDim2.fromOffset(210, 19), 10, C.muted, true)
+        label(content, "POSITIONAL ARGUMENTS (JSON)", UDim2.fromOffset(184, 93), UDim2.fromOffset(320, 19), 10, C.muted, true)
+        local delayBox = inputField(content, "0.01", 20, 117, 146, "0.01")
+        local argsBox = inputField(content, "[1, true, \"text\"]", 184, 117, 385, "[]")
+        self.refs.interval = delayBox
+        self.refs.args = argsBox
+
+        button(content, "Fire Once", 20, 179, 105, C.field, function() self:FireOnce(self.selected) end)
+        button(content, "Start Loop", 134, 179, 103, Color3.fromRGB(33, 119, 96), function() self:Start(self.selected) end)
+        button(content, "Stop", 246, 179, 86, Color3.fromRGB(134, 66, 78), function() self:Stop(self.selected) end)
+        button(content, "Stop All", 341, 179, 99, C.field, function() self:StopAll() end)
+        button(content, "Copy Path", 449, 179, 120, C.field, function() self:CopyPath(self.selected) end)
+
+        local countLabel = label(content, "LOOPS 0/3       CALLS 0       ERRORS 0", UDim2.fromOffset(20, 232), UDim2.fromOffset(545, 20), 12, C.muted, true)
+        self.refs.stats = countLabel
+        label(content, "ACTIVITY  /  ERRORS", UDim2.fromOffset(20, 267), UDim2.fromOffset(260, 18), 10, C.muted, true)
+        local logs = rounded(newObj("ScrollingFrame", content, {
+            Name = "ActivityLog", Position = UDim2.fromOffset(20, 291),
+            Size = UDim2.fromOffset(549, 69), BackgroundColor3 = C.panel,
+            BorderSizePixel = 0, ScrollBarThickness = 3,
+            ScrollBarImageColor3 = C.accent,
+            CanvasSize = UDim2.new(), ScrollingDirection = Enum.ScrollingDirection.Y,
+        }), 8)
+        local list = newObj("UIListLayout", logs, {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder})
+        newObj("UIPadding", logs, {PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 7)})
+        label(content, "JSON example: [1, true, \"hello\"]  |  nil: {\"$type\":\"nil\"}",
+            UDim2.fromOffset(20, 360), UDim2.fromOffset(549, 15), 10, C.muted)
+        self.refs.logs = logs
+        self.refs.list = list
+        self.refs.panel = panel
+        self.gui = gui
+
+        local dragging, dragStart, initialPosition = false, nil, nil
+        table.insert(self.connections, header.InputBegan:Connect(function(io)
+            if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = io.Position
+                initialPosition = panel.Position
+            end
+        end))
+        table.insert(self.connections, Input.InputChanged:Connect(function(io)
+            if dragging and (io.UserInputType == Enum.UserInputType.MouseMovement or io.UserInputType == Enum.UserInputType.Touch) then
+                local diff = io.Position - dragStart
+                panel.Position = UDim2.new(initialPosition.X.Scale, initialPosition.X.Offset + diff.X,
+                    initialPosition.Y.Scale, initialPosition.Y.Offset + diff.Y)
+            end
+        end))
+        table.insert(self.connections, Input.InputEnded:Connect(function(io)
+            if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then dragging = false end
+        end))
+        self:RenderLog()
+        self:Refresh(true)
+    end
+
+    function Studio:RenderLog()
+        local box, list = self.refs.logs, self.refs.list
+        if not box or not list then return end
+        for _, child in ipairs(box:GetChildren()) do
+            if child:IsA("TextLabel") then child:Destroy() end
+        end
+        for i = math.min(#self.messages, 18), 1, -1 do
+            local item = self.messages[i]
+            local tint = item.severity == "error" and C.red or item.severity == "success" and C.green or C.muted
+            newObj("TextLabel", box, {
+                BackgroundTransparency = 1,
+                Size = UDim2.new(1, -15, 0, 18), Text = item.text,
+                Font = Enum.Font.Code, TextSize = 11,
+                TextColor3 = tint, TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                LayoutOrder = 19-i,
+            })
+        end
+        box.CanvasSize = UDim2.fromOffset(0, math.max(65, math.min(#self.messages, 18)*21+14))
+    end
+
+    function Studio:Refresh(selectionChanged)
+        local r = self.refs
+        if not r.stats then return end
+        local rem = self.selected
+        if not remoteOK(rem) then
+            r.selected.Text = "No remote selected"
+            r.path.Text = "Right-click a remote in Dex and choose Remote Studio"
+            if selectionChanged then r.interval.Text, r.args.Text = "0.01", "[]" end
+        else
+            local selectedJob = self.jobs[rem]
+            local jobState = selectedJob and (selectedJob.running and "  [RUNNING]" or "  [STOPPING]") or "  [IDLE]"
+            r.selected.Text = rem.Name .. "   /   " .. rem.ClassName .. jobState
+            r.path.Text = fullPath(rem)
+            if selectionChanged then
+                local cfg = configFor(rem)
+                r.interval.Text = tostring(cfg.interval)
+                r.args.Text = cfg.argsText
+            end
+        end
+        r.stats.Text = string.format("LOOPS %d/%d       CALLS %d       ERRORS %d",
+            self:ActiveCount(), self.maxActive, self.totals.sent, self.totals.failed)
+    end
+
+    function Studio:Show()
+        if self.destroyed then return end
+        self:Build()
+        if self.gui then self.gui.Enabled = true end
+        self:Refresh(false)
+    end
+    function Studio:Hide()
+        if self.gui then self.gui.Enabled = false end
+    end
+    function Studio:Toggle()
+        if self.gui and self.gui.Enabled then self:Hide() else self:Show() end
+    end
+    function Studio:Destroy()
+        self:StopAll()
+        self.destroyed = true
+        for _, connection in ipairs(self.connections) do pcall(function() connection:Disconnect() end) end
+        self.connections = {}
+        if self.gui then pcall(function() self.gui:Destroy() end) end
+        self.gui = nil
+    end
+
+    table.insert(Studio.connections, Input.InputBegan:Connect(function(io, processed)
+        if not processed and io.KeyCode == Enum.KeyCode.F7 and Input:GetFocusedTextBox() == nil then
+            Studio:Toggle()
+        end
+    end))
+    task.spawn(function()
+        while not Studio.destroyed do
+            if Studio.gui and Studio.gui.Enabled then Studio:Refresh(false) end
+            task.wait(0.4)
+        end
     end)
-    if not downloaded then
-        warn("[NOVA Dex] Download failed: " .. tostring(sourceOrError))
-        notify("Dex++", "Download failed; check console")
+    return Studio
+end
+local IY_DexStudio = iyCreateDexStudio()
+
+
+-- The upstream Dex++ Explorer remains intact. Only right-click actions are injected.
+local IY_DEX_URL = "https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua"
+local IY_DEX_MENU_MARKER = 'if presentClasses["RemoteEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end'
+local IY_DEX_REG_MARKER = 'Explorer.RightClickContext = context'
+
+local IY_DEX_MENU_INSERT = [==[
+        -- These actions are injected into Dex++'s own right-click Explorer menu.
+        if #sList == 1 then
+            local dexNode = sList[1]
+            local dexObj = dexNode and dexNode.Obj
+            if dexObj and (dexObj:IsA("RemoteEvent") or dexObj:IsA("RemoteFunction") or dexObj:IsA("UnreliableRemoteEvent")) then
+                context:QueueDivider()
+                context:AddRegistered("IY_STUDIO_OPEN")
+                context:AddRegistered("IY_STUDIO_ONCE")
+                context:AddRegistered("IY_STUDIO_START")
+                context:AddRegistered("IY_STUDIO_STOP")
+                context:AddRegistered("IY_STUDIO_STOP_ALL")
+            end
+        end
+]==]
+local IY_DEX_REG_INSERT = [==[
+        -- Reference the standalone controller, not a second set of background loops.
+        local dexEnv = (type(getgenv) == "function" and getgenv()) or _G
+        local function dexRemoteStudio()
+            local studio = dexEnv.IY_DexRemoteStudio
+            if type(studio) == "table" and type(studio.Select) == "function" then return studio end
+            warn("[Dex Remote Studio] Controller is not available")
+            return nil
+        end
+        local function dexPickedRemote()
+            local current = selection.List
+            if #current ~= 1 then return nil end
+            local node = current[1]
+            return node and node.Obj
+        end
+        local function dexDo(action, show)
+            local studio = dexRemoteStudio()
+            local remote = dexPickedRemote()
+            if not studio or not studio:IsRemote(remote) then return end
+            studio:Select(remote, show)
+            if action == "once" then studio:FireOnce(remote) end
+            if action == "start" then studio:Start(remote) end
+            if action == "stop" then studio:Stop(remote) end
+            if action == "stopall" then studio:StopAll() end
+        end
+        context:Register("IY_STUDIO_OPEN", {
+            Name = "Remote Studio / Configure", IconMap = Explorer.MiscIcons,
+            Icon = "ViewScript", OnClick = function() dexDo(nil, true) end,
+        })
+        context:Register("IY_STUDIO_ONCE", {
+            Name = "Remote Studio / Fire Once", IconMap = Explorer.MiscIcons,
+            Icon = "Play", OnClick = function() dexDo("once", false) end,
+        })
+        context:Register("IY_STUDIO_START", {
+            Name = "Remote Studio / Start Auto Fire", IconMap = Explorer.MiscIcons,
+            Icon = "Play", OnClick = function() dexDo("start", true) end,
+        })
+        context:Register("IY_STUDIO_STOP", {
+            Name = "Remote Studio / Stop Auto Fire", IconMap = Explorer.MiscIcons,
+            Icon = "Pause", OnClick = function() dexDo("stop", false) end,
+        })
+        context:Register("IY_STUDIO_STOP_ALL", {
+            Name = "Remote Studio / Stop All", IconMap = Explorer.MiscIcons,
+            Icon = "Pause", OnClick = function() dexDo("stopall", false) end,
+        })
+]==]
+
+local function iyDexInsertBefore(text, anchor, insertion)
+    local at = string.find(text, anchor, 1, true)
+    if not at then return nil, "Missing compatibility anchor: " .. anchor end
+    if string.find(text, anchor, at + #anchor, true) then
+        return nil, "Duplicate compatibility anchor: " .. anchor
+    end
+    return string.sub(text, 1, at - 1) .. insertion .. string.sub(text, at)
+end
+
+local function iyDexPatch(sourceText)
+    if type(sourceText) ~= "string" or #sourceText < 1000 then
+        return nil, "Dex++ download empty or incomplete"
+    end
+    if string.find(sourceText, 'context:Register("IY_STUDIO_OPEN"', 1, true) then
+        return sourceText
+    end
+    if not string.find(sourceText, "Explorer.InitRightClick", 1, true) then
+        return nil, "Unrecognized Dex++ Explorer format"
+    end
+    local edited, err = iyDexInsertBefore(sourceText, IY_DEX_MENU_MARKER, IY_DEX_MENU_INSERT)
+    if not edited then return nil, err end
+    return iyDexInsertBefore(edited, IY_DEX_REG_MARKER, IY_DEX_REG_INSERT)
+end
+
+local dexLaunchBusy = false
+addcmd("explorer", {"dex"}, function(args, speaker)
+    if dexLaunchBusy then
+        notify("Dex++", "Dex is already starting")
         return
     end
-    local patched, patchError = novaPatchDex(sourceOrError)
-    if not patched then
-        warn("[NOVA Dex] " .. tostring(patchError))
-        notify("Dex++", "Patch incompatible with this Dex++ version")
-        return
-    end
-    local compiled, syntaxError = loadstring(patched)
-    if type(compiled) ~= "function" then
-        warn("[NOVA Dex] Compilation failed: " .. tostring(syntaxError))
-        notify("Dex++", "Failed to compile patched Dex++")
-        return
-    end
-    local launched, runtimeError = pcall(compiled)
-    if not launched then
-        warn("[NOVA Dex] Launch error: " .. tostring(runtimeError))
-        notify("Dex++", "Launch failed; check console")
-    end
+    dexLaunchBusy = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            notify("Dex++", "Loading Explorer + Remote Studio")
+            local sourceText = game:HttpGet(IY_DEX_URL)
+            local patched, patchError = iyDexPatch(sourceText)
+            if not patched then error(patchError) end
+            local compiled, syntaxError = loadstring(patched)
+            if type(compiled) ~= "function" then error("Dex++ compilation: " .. tostring(syntaxError)) end
+            compiled()
+        end)
+        dexLaunchBusy = false
+        if not ok then
+            warn("[Dex Remote Studio] " .. tostring(err))
+            notify("Dex++", "Could not launch; see F9 console")
+        end
+    end)
+end)
+
+-- The only new command outside original Infinite Yield is this Dex panel shortcut.
+addcmd("dexstudio", {"dexpanel"}, function()
+    IY_DexStudio:Show()
 end)
 
 addcmd("moondex", {"mdex"}, function(args, speaker)
@@ -13885,5429 +14025,3 @@ task.spawn(function()
     IntroBackground:Destroy()
     minimizeHolder()
 end)
-
---[[
-    IY NOVA ENHANCEMENTS | additive extension to Infinite Yield FE 6.4.2
-    Keeps original command registrations, settings, themes and plugins intact.
-    New features: command palette, favorites, persistent recents, usage statistics,
-    in-client performance monitor, searchable help and error diagnostics.
-    No externally fetched code or third-party dependencies are added here.
-]]
-do
-    local localPlayer = Players.LocalPlayer
-    local sessionStart = os.clock()
-    -- Capture provenance BEFORE registering the first NOVA command. This avoids
-    -- guesses based on names and keeps pre-existing IY / plugin commands intact.
-    local originalCommandNames = {}
-    local originalCount = 0
-    for _, command in ipairs(cmds) do
-        if type(command.NAME) == "string" then
-            originalCommandNames[command.NAME:lower()] = true
-            originalCount = originalCount + 1
-        end
-    end
-    local theme = {
-        bg = Color3.fromRGB(18, 22, 32),
-        panel = Color3.fromRGB(28, 34, 47),
-        hover = Color3.fromRGB(43, 53, 72),
-        input = Color3.fromRGB(35, 42, 57),
-        text = Color3.fromRGB(238, 243, 252),
-        muted = Color3.fromRGB(151, 166, 189),
-        accent = Color3.fromRGB(101, 157, 255),
-        success = Color3.fromRGB(82, 229, 174),
-        indigo = Color3.fromRGB(135, 110, 255),
-        stroke = Color3.fromRGB(68, 82, 117),
-    }
-    local storePath = "IY_NOVA.iy"
-    local store = {favorites = {}, recent = {}, counts = {}, appearance = {theme="blue", scale=1, quickbar=false}}
-    local sessionRuns = 0
-    local savePending = false
-    local paletteOpen = false
-    local mode = "All"
-    local group = "All"
-    local selectedCommand = nil
-    local groupCache = {}
-    local groupCacheCount = -1
-    local lastSearch = ""
-    local refreshList
-    local refreshQuickbar
-    local pageLimit = 48
-    local paletteSelectionIndex = 1
-    local activatePalette
-    local setPaletteVisible
-
-    -- A bad or outdated extension save should never stop Infinite Yield booting.
-    if type(waxreadfile) == "function" then
-        local ok, contents = pcall(waxreadfile, storePath)
-        if ok and type(contents) == "string" then
-            local decoded, loaded = pcall(function() return HttpService:JSONDecode(contents) end)
-            if decoded and type(loaded) == "table" then
-                if type(loaded.appearance) == "table" then
-                    local ap = loaded.appearance
-                    if type(ap.theme) == "string" then store.appearance.theme = ap.theme end
-                    if type(ap.quickbar) == "boolean" then store.appearance.quickbar = ap.quickbar end
-                    if type(ap.scale) == "number" and ap.scale == ap.scale then
-                        store.appearance.scale = math.clamp(ap.scale, 0.8, 1.25)
-                    end
-                end
-                if type(loaded.favorites) == "table" then
-                    for _, value in ipairs(loaded.favorites) do
-                        if type(value) == "string" and #value <= 72 and #store.favorites < 100 then
-                            table.insert(store.favorites, value:lower())
-                        end
-                    end
-                end
-                if type(loaded.recent) == "table" then
-                    for _, value in ipairs(loaded.recent) do
-                        if type(value) == "string" and #value <= 256 and #store.recent < 40 then
-                            table.insert(store.recent, value)
-                        end
-                    end
-                end
-                if type(loaded.counts) == "table" then
-                    for name, count in pairs(loaded.counts) do
-                        if type(name) == "string" and type(count) == "number" and count >= 0 and count < math.huge then
-                            store.counts[name] = math.floor(count)
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- Reuse IY's built-in Up/Down history navigation after a reconnect.
-    for index = 1, math.min(#store.recent, 30) do
-        cmdHistory[index] = store.recent[index]
-    end
-
-    local function saveSoon()
-        if savePending or type(waxwritefile) ~= "function" then return end
-        savePending = true
-        task.delay(1.25, function()
-            savePending = false
-            local ok, data = pcall(function()
-                return HttpService:JSONEncode(store)
-            end)
-            if ok then
-                local wrote, err = pcall(waxwritefile, storePath, data)
-                if not wrote and _G.IY_DEBUG then warn("NOVA settings save failed:", err) end
-            end
-        end)
-    end
-
-    local function normalizeName(raw)
-        if type(raw) ~= "string" then return nil end
-        local first = raw:match("^%s*([^%s]+)")
-        if not first then return nil end
-        local command = findCmd(first)
-        return command and command.NAME:lower() or nil
-    end
-
-    local function favoriteIndex(name)
-        for index, value in ipairs(store.favorites) do
-            if value == name then return index end
-        end
-        return nil
-    end
-
-    local function toggleFavorite(name)
-        if not name or not findCmd(name) then return false end
-        local index = favoriteIndex(name)
-        if index then
-            table.remove(store.favorites, index)
-        elseif #store.favorites < 100 then
-            table.insert(store.favorites, name)
-        else
-            notify("Favorites", "The 100-command favorites limit has been reached.")
-            return false
-        end
-        saveSoon()
-        if refreshList then refreshList() end
-        if refreshQuickbar then refreshQuickbar() end
-        return not index
-    end
-
-    -- A light wrapper logs command dispatches without modifying IY's existing parser,
-    -- plugins, aliases, commands, or keybind callbacks.
-    local originalExecute = execCmd
-    execCmd = function(commandString, speaker, shouldStore)
-        local clean = tostring(commandString or ""):gsub("^%s+", ""):gsub("%s+$", "")
-        if clean == "" then return end
-        if not speaker or speaker == localPlayer then
-            sessionRuns = sessionRuns + 1
-            local key = (clean:match("^([^%s]+)") or ""):lower()
-            local repeatPrefix = key:match("^%d+%^") or key:match("^inf%^")
-            if repeatPrefix then
-                local withoutPrefix = clean:gsub("^%d+%^[%d%.]*%^?", ""):gsub("^inf%^[%d%.]*%^?", "")
-                key = (withoutPrefix:match("^([^%s]+)") or key):lower()
-            end
-            local command = findCmd(key)
-            if command then key = command.NAME:lower() end
-            store.counts[key] = (store.counts[key] or 0) + 1
-            if store.recent[1] ~= clean then
-                table.insert(store.recent, 1, clean:sub(1, 256))
-                while #store.recent > 40 do table.remove(store.recent) end
-            end
-            saveSoon()
-        end
-        return originalExecute(clean, speaker, shouldStore)
-    end
-
-    local function node(kind, parent, props)
-        local item = Instance.new(kind)
-        for key, value in pairs(props or {}) do item[key] = value end
-        item.Parent = parent
-        return item
-    end
-
-    local function round(item, size)
-        node("UICorner", item, {CornerRadius = UDim.new(0, size or 9)})
-    end
-
-    local helpMap = {}
-    for _, record in ipairs(CMDs) do
-        local key = type(record.NAME) == "string" and record.NAME:match("^%s*([%w_]+)")
-        if key and type(record.DESC) == "string" and record.DESC ~= "" then
-            helpMap[key:lower()] = record.DESC
-        end
-    end
-    local function commandHelp(name)
-        local value = helpMap[name:lower()]
-        if value then return value end
-        for _, gui in ipairs(CMDsF:GetChildren()) do
-            if gui:IsA("TextButton") and gui:GetAttribute("Desc") then
-                local title = tostring(gui:GetAttribute("Title") or ""):lower()
-                local lowered = name:lower()
-                if title == lowered or title:sub(1, #lowered + 1) == lowered .. " " or
-                    title:sub(1, #lowered + 1) == lowered .. "[" then
-                    helpMap[lowered] = tostring(gui:GetAttribute("Desc"))
-                    return helpMap[lowered]
-                end
-            end
-        end
-        return "Added command (see command documentation for arguments)."
-    end
-
-    local function updateCommandGroups()
-        if groupCacheCount == #cmds then return end
-        groupCacheCount = #cmds
-        groupCache = {}
-        for _, label in ipairs(CMDsF:GetChildren()) do
-            if label:IsA("TextButton") and label.Name:sub(1, 11) == "PLUGIN_NOVA" then
-                local key = tostring(label.Text):match("^([%w_]+)")
-                if key then
-                    local pack = "Utilities"
-                    if label.Name:find("GAMEPLAY", 1, true) then pack = "Gameplay"
-                    elseif label.Name:find("PROGRESSION", 1, true) then pack = "Progression"
-                    elseif label.Name:find("ADVANCED", 1, true) then pack = "Advanced"
-                    elseif label.Name:find("STUDIO", 1, true) then pack = "Studio" end
-                    groupCache[key:lower()] = pack
-                end
-            end
-        end
-    end
-    local function commandGroup(name)
-        name = tostring(name or ""):lower()
-        if originalCommandNames[name] then return "Infinite Yield" end
-        updateCommandGroups()
-        return groupCache[name] or "Utilities"
-    end
-    local function groupMatches(name)
-        local original = originalCommandNames[tostring(name):lower()] == true
-        if mode == "Infinite Yield" and not original then return false end
-        if mode == "NOVA Additions" and original then return false end
-        if mode == "NOVA Additions" and group ~= "All" and commandGroup(name) ~= group then return false end
-        return true
-    end
-    local function countGroups()
-        local old, extra = 0, 0
-        for _, cmd in ipairs(cmds) do
-            if originalCommandNames[tostring(cmd.NAME):lower()] then old = old + 1 else extra = extra + 1 end
-        end
-        return old, extra
-    end
-
-    -- The palette is part of the existing GUI tree, so no second ScreenGui is
-    -- needed, and the CaptureService visibility behavior stays consistent.
-    local overlay = node("Frame", ScaledHolder, {
-        Name = "NOVA_CommandPaletteOverlay", Active = true,
-        BackgroundColor3 = Color3.fromRGB(2, 5, 14), BackgroundTransparency = 0.16,
-        Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 60
-    })
-    local palette = node("Frame", overlay, {
-        Name = "Palette", BackgroundColor3 = theme.bg,
-        BorderSizePixel = 0, ZIndex = 61,
-    })
-    round(palette, 18)
-    node("UIStroke", palette, {Color = theme.stroke, Thickness = 1.5, Transparency = 0.12})
-    node("UIGradient", palette, {Rotation = 120, Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(17, 22, 38)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 14, 26))})})
-    local topAccent = node("Frame", palette, {Name = "NOVA_AccentBar", BorderSizePixel = 0,
-        BackgroundColor3 = theme.accent, Size = UDim2.new(1, -40, 0, 3),
-        Position = UDim2.fromOffset(20, 0), ZIndex = 62})
-    round(topAccent, 3)
-    node("UIGradient", topAccent, {Color = ColorSequence.new(theme.accent, theme.indigo)})
-
-    local heading = node("TextLabel", palette, {
-        Name = "Header", BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(20, 11), Size = UDim2.new(1, -175, 0, 30),
-        Font = Enum.Font.GothamBold, TextSize = 20,
-        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = theme.text,
-        Text = "NOVA   /   COMMAND CENTER", ZIndex = 62
-    })
-    local countText = node("TextLabel", palette, {Name = "CommandCounts",
-        Position = UDim2.new(1, -177, 0, 17), Size = UDim2.fromOffset(129, 20),
-        Text = "", BackgroundTransparency = 1, TextColor3 = theme.muted,
-        TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Right,
-        ZIndex = 63})
-    local close = node("TextButton", palette, {
-        Position = UDim2.new(1, -42, 0, 13), Size = UDim2.fromOffset(28, 28),
-        BackgroundColor3 = theme.panel, Text = "×", TextSize = 25,
-        Font = Enum.Font.Gotham, TextColor3 = theme.text, ZIndex = 63,
-        AutoButtonColor = true
-    })
-    round(close, 7)
-    local search = node("TextBox", palette, {
-        Name = "Search", Position = UDim2.new(0, 20, 0, 56),
-        Size = UDim2.new(1, -40, 0, 42), BackgroundColor3 = theme.input,
-        BorderSizePixel = 0, Font = Enum.Font.Gotham,
-        TextSize = 14, TextColor3 = theme.text, PlaceholderColor3 = theme.muted,
-        PlaceholderText = "⌕   Search by command, description, or alias...",
-        Text = "", ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
-        ZIndex = 63
-    })
-    round(search, 10)
-    node("UIStroke", search, {Color = theme.stroke, Transparency = 0.55, Thickness = 1})
-    node("UIPadding", search, {PaddingLeft = UDim.new(0, 13), PaddingRight = UDim.new(0, 9)})
-
-    -- Horizontally scrollable tabs never squash the names on smaller viewports.
-    local tabHolder = node("ScrollingFrame", palette, {
-        Name = "Sources", BackgroundTransparency = 1,
-        Position = UDim2.new(0, 20, 0, 108), Size = UDim2.new(1, -40, 0, 34),
-        ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 0,
-        CanvasSize = UDim2.fromOffset(641, 0), ZIndex = 62
-    })
-    local buttons = {}
-    local tabItems = {
-        {"All", 76}, {"Infinite Yield", 141}, {"NOVA Additions", 143},
-        {"Favorites", 111}, {"Recent", 94}
-    }
-    local tabX = 0
-    for _, item in ipairs(tabItems) do
-        local tab, width = item[1], item[2]
-        local button = node("TextButton", tabHolder, {
-            Name = tab, Position = UDim2.fromOffset(tabX, 1),
-            Size = UDim2.fromOffset(width, 31), BackgroundColor3 = theme.panel,
-            BorderSizePixel = 0, Text = tab, TextColor3 = theme.muted,
-            Font = Enum.Font.GothamSemibold, TextSize = 12,
-            AutoButtonColor = true, ZIndex = 63
-        })
-        round(button, 8)
-        buttons[tab] = button
-        tabX = tabX + width + 8
-    end
-    tabHolder.CanvasSize = UDim2.fromOffset(tabX, 0)
-
-    local groupBar = node("ScrollingFrame", palette, {
-        Name = "AdditionFilters", BackgroundTransparency = 1,
-        Position = UDim2.new(0, 20, 0, 148), Size = UDim2.new(1, -40, 0, 30),
-        ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 0,
-        CanvasSize = UDim2.fromOffset(545, 0), ZIndex = 63,
-        Visible = false
-    })
-    local groupButtons = {}
-    local groupX = 0
-    for _, item in ipairs({{"All", 64}, {"Gameplay", 91}, {"Progression", 103},
-        {"Advanced", 91}, {"Utilities", 82}, {"Studio", 69}}) do
-        local category, width = item[1], item[2]
-        local button = node("TextButton", groupBar, {
-            Name = category, Position = UDim2.fromOffset(groupX, 0),
-            Size = UDim2.fromOffset(width, 27),
-            BackgroundColor3 = theme.panel, BorderSizePixel = 0,
-            Text = category, TextColor3 = theme.muted,
-            Font = Enum.Font.Gotham, TextSize = 12, ZIndex = 64
-        })
-        round(button, 8)
-        groupButtons[category] = button
-        groupX = groupX + width + 7
-    end
-    groupBar.CanvasSize = UDim2.fromOffset(groupX, 0)
-
-    local listFrame = node("ScrollingFrame", palette, {
-        Name = "Results", Position = UDim2.new(0, 20, 0, 184),
-        Size = UDim2.new(1, -40, 1, -299), BackgroundColor3 = theme.panel,
-        BorderSizePixel = 0, ScrollBarThickness = 4,
-        ScrollBarImageColor3 = theme.accent, CanvasSize = UDim2.fromOffset(0, 0),
-        ZIndex = 62
-    })
-    round(listFrame, 11)
-    node("UIStroke", listFrame, {Color = theme.stroke, Thickness = 1, Transparency = 0.72})
-    local layout = node("UIListLayout", listFrame, {
-        Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder
-    })
-    node("UIPadding", listFrame, {
-        PaddingTop = UDim.new(0, 5), PaddingLeft = UDim.new(0, 5),
-        PaddingRight = UDim.new(0, 9), PaddingBottom = UDim.new(0, 5)
-    })
-    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        listFrame.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 12)
-    end)
-
-    local commandInput = node("TextBox", palette, {
-        Name = "CommandInput", Position = UDim2.new(0, 20, 1, -101),
-        Size = UDim2.new(1, -40, 0, 37), BackgroundColor3 = theme.input,
-        BorderSizePixel = 0, Font = Enum.Font.Code, TextSize = 14,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextColor3 = theme.text, PlaceholderColor3 = theme.muted,
-        PlaceholderText = "Select a command, then edit its arguments", Text = "",
-        ClearTextOnFocus = false, ZIndex = 63
-    })
-    round(commandInput, 9)
-    node("UIStroke", commandInput, {Color = theme.stroke, Thickness = 1, Transparency = 0.58})
-    node("UIPadding", commandInput, {PaddingLeft = UDim.new(0, 10)})
-    local runButton = node("TextButton", palette, {
-        Name = "Run", Position = UDim2.new(0, 20, 1, -52),
-        Size = UDim2.new(0.5, -26, 0, 36), BackgroundColor3 = theme.accent,
-        TextColor3 = theme.bg, Text = "Run command", Font = Enum.Font.GothamBold,
-        TextSize = 13, ZIndex = 63
-    })
-    round(runButton, 7)
-    local editButton = node("TextButton", palette, {
-        Name = "Edit", Position = UDim2.new(0.5, 6, 1, -52),
-        Size = UDim2.new(0.5, -26, 0, 36), BackgroundColor3 = theme.hover,
-        TextColor3 = theme.text, Text = "Open in command bar",
-        Font = Enum.Font.GothamSemibold, TextSize = 12, ZIndex = 63
-    })
-    round(editButton, 9)
-    node("UIGradient", runButton, {Color = ColorSequence.new(theme.accent, theme.indigo)})
-    node("UIStroke", editButton, {Color = theme.stroke, Transparency = 0.5})
-    local footerHint = node("TextLabel", palette, {
-        Name = "FooterHint", Position = UDim2.new(0, 22, 1, -120),
-        Size = UDim2.new(1, -44, 0, 16), BackgroundTransparency = 1,
-        Text = "F2 / CTRL+K  •  STAR TO FAVORITE  •  ESC TO CLOSE",
-        Font = Enum.Font.Gotham, TextSize = 10,
-        TextColor3 = theme.muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 63
-    })
-
-    local function resizePalette()
-        local camera = workspace.CurrentCamera
-        local viewport = camera and camera.ViewportSize or Vector2.new(900, 650)
-        local guiScaleNumber = (Scale and Scale.Scale) or 1
-        if guiScaleNumber <= 0 then guiScaleNumber = 1 end
-        local w = math.floor(math.clamp(viewport.X / guiScaleNumber - 28, 280, 740))
-        local h = math.floor(math.clamp(viewport.Y / guiScaleNumber - 36, 345, 600))
-        palette.Size = UDim2.fromOffset(w, h)
-        palette.Position = UDim2.new(0.5, -math.floor(w / 2), 0.5, -math.floor(h / 2))
-        if paletteOpen and refreshList then refreshList() end
-    end
-    resizePalette()
-    if Scale then Scale:GetPropertyChangedSignal("Scale"):Connect(resizePalette) end
-    local paletteCameraConnection
-    local function bindPaletteCamera()
-        if paletteCameraConnection then
-            paletteCameraConnection:Disconnect()
-            paletteCameraConnection = nil
-        end
-        local camera = workspace.CurrentCamera
-        if camera then
-            paletteCameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(resizePalette)
-        end
-        resizePalette()
-    end
-    workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindPaletteCamera)
-    bindPaletteCamera()
-
-    local function updateTabs()
-        local core, nova = countGroups()
-        countText.Text = string.format("%d CORE  /  %d NOVA", core, nova)
-        for name, button in pairs(buttons) do
-            local active = name == mode
-            button.BackgroundColor3 = active and theme.accent or theme.panel
-            button.TextColor3 = active and theme.bg or theme.muted
-        end
-        groupBar.Visible = mode == "NOVA Additions"
-        for name, button in pairs(groupButtons) do
-            local active = name == group
-            button.BackgroundColor3 = active and theme.indigo or theme.panel
-            button.TextColor3 = active and theme.text or theme.muted
-        end
-        local h = palette.Size.Y.Offset
-        local narrow = palette.Size.X.Offset < 570
-        local short = h < 465
-        countText.Visible = not narrow
-        heading.TextSize = narrow and 15 or 20
-        heading.Size = UDim2.new(1, narrow and -60 or -175, 0, 30)
-        footerHint.Visible = not short
-        if short then
-            search.Position = UDim2.fromOffset(20, 50)
-            search.Size = UDim2.new(1, -40, 0, 34)
-            tabHolder.Position = UDim2.fromOffset(20, 91)
-            groupBar.Position = UDim2.fromOffset(20, 124)
-            commandInput.Position = UDim2.new(0, 20, 1, -91)
-            commandInput.Size = UDim2.new(1, -40, 0, 32)
-            runButton.Position = UDim2.new(0, 20, 1, -48)
-            editButton.Position = UDim2.new(0.5, 6, 1, -48)
-            if mode == "NOVA Additions" then
-                listFrame.Position = UDim2.new(0, 20, 0, 157)
-                listFrame.Size = UDim2.new(1, -40, 1, -260)
-            else
-                listFrame.Position = UDim2.new(0, 20, 0, 123)
-                listFrame.Size = UDim2.new(1, -40, 1, -226)
-            end
-        else
-            search.Position = UDim2.fromOffset(20, 56)
-            search.Size = UDim2.new(1, -40, 0, 42)
-            tabHolder.Position = UDim2.fromOffset(20, 108)
-            groupBar.Position = UDim2.fromOffset(20, 148)
-            commandInput.Position = UDim2.new(0, 20, 1, -101)
-            commandInput.Size = UDim2.new(1, -40, 0, 37)
-            runButton.Position = UDim2.new(0, 20, 1, -52)
-            editButton.Position = UDim2.new(0.5, 6, 1, -52)
-            if mode == "NOVA Additions" then
-                listFrame.Position = UDim2.new(0, 20, 0, 184)
-                listFrame.Size = UDim2.new(1, -40, 1, -299)
-            else
-                listFrame.Position = UDim2.new(0, 20, 0, 150)
-                listFrame.Size = UDim2.new(1, -40, 1, -265)
-            end
-        end
-    end
-
-    local function selectCommand(value)
-        selectedCommand = normalizeName(value)
-        commandInput.Text = value
-    end
-
-    local function appendRow(name, detail, key, position)
-        local source = key and commandGroup(key) or "History"
-        local line = node("Frame", listFrame, {
-            Name = "NOVA_Row", LayoutOrder = position,
-            Size = UDim2.new(1, -5, 0, 58), BackgroundColor3 = theme.bg,
-            BorderSizePixel = 0, ZIndex = 63
-        })
-        round(line, 9)
-        node("UIStroke", line, {Color = theme.stroke, Transparency = 0.84, Thickness = 1})
-        line:SetAttribute("CommandText", name)
-        local pick = node("TextButton", line, {
-            Size = UDim2.new(1, -45, 1, 0), BackgroundTransparency = 1,
-            Text = "", ZIndex = 64
-        })
-        node("TextLabel", pick, {
-            BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 4),
-            Size = UDim2.new(1, -16, 0, 20),
-            Font = Enum.Font.GothamSemibold, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextTruncate = Enum.TextTruncate.AtEnd,
-            Text = name, TextColor3 = theme.text, ZIndex = 65
-        })
-        node("TextLabel", pick, {
-            BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 29),
-            Size = UDim2.new(1, -16, 0, 22), Font = Enum.Font.Gotham,
-            TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
-            TextTruncate = Enum.TextTruncate.AtEnd,
-            Text = string.upper(source) .. "   •   " .. detail,
-            TextColor3 = theme.muted, ZIndex = 65
-        })
-        pick.MouseButton1Click:Connect(function()
-            selectCommand(name)
-            commandInput:CaptureFocus()
-            commandInput.CursorPosition = #commandInput.Text + 1
-        end)
-        if key then
-            local favorite = node("TextButton", line, {
-                Position = UDim2.new(1, -39, 0, 12),
-                Size = UDim2.fromOffset(32, 32), BackgroundColor3 = theme.panel,
-                Text = favoriteIndex(key) and "★" or "☆", TextSize = 23,
-                TextColor3 = theme.accent, Font = Enum.Font.Gotham,
-                ZIndex = 65
-            })
-            round(favorite, 7)
-            favorite.MouseButton1Click:Connect(function()
-                toggleFavorite(key)
-            end)
-        end
-    end
-
-    local function addEmpty(message)
-        node("TextLabel", listFrame, {
-            Name = "Empty", Size = UDim2.new(1, -7, 0, 55),
-            LayoutOrder = 1, BackgroundTransparency = 1,
-            Text = message, TextColor3 = theme.muted,
-            Font = Enum.Font.Gotham, TextSize = 13,
-            TextWrapped = true, ZIndex = 63
-        })
-    end
-
-    refreshList = function()
-        if not overlay or not overlay.Parent then return end
-        for _, child in ipairs(listFrame:GetChildren()) do
-            if child:IsA("Frame") or child:IsA("TextLabel")
-                or (child:IsA("TextButton") and child.Name == "NOVA_LoadMore") then
-                child:Destroy()
-            end
-        end
-        updateTabs()
-        updateCommandGroups()
-        local q = search.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
-        local shown, total = 0, 0
-        local limit = pageLimit -- 48 at first, optional extra pages (max 192)
-        if mode == "Recent" then
-            for _, raw in ipairs(store.recent) do
-                local key = normalizeName(raw)
-                if q == "" or raw:lower():find(q, 1, true) then
-                    total = total + 1
-                    if shown < limit then
-                        shown = shown + 1
-                        appendRow(raw, key and commandHelp(key) or "Previous command", key, shown)
-                    end
-                end
-            end
-        else
-            local candidates = {}
-            for _, cmd in ipairs(cmds) do
-                local name = cmd.NAME
-                local desc = commandHelp(name)
-                local matches = q == "" or name:lower():find(q, 1, true)
-                    or desc:lower():find(q, 1, true)
-                if not matches then
-                    for _, alias in ipairs(cmd.ALIAS or {}) do
-                        if alias:lower():find(q, 1, true) then matches = true break end
-                    end
-                end
-                if matches and groupMatches(name) and (mode ~= "Favorites" or favoriteIndex(name:lower())) then
-                    table.insert(candidates, {name = name, desc = desc})
-                end
-            end
-            table.sort(candidates, function(a, b)
-                local aFav = favoriteIndex(a.name:lower()) and 1 or 0
-                local bFav = favoriteIndex(b.name:lower()) and 1 or 0
-                if aFav ~= bFav then return aFav > bFav end
-                if q ~= "" then
-                    local ae = a.name:lower():find(q, 1, true) == 1
-                    local be = b.name:lower():find(q, 1, true) == 1
-                    if ae ~= be then return ae end
-                end
-                return a.name:lower() < b.name:lower()
-            end)
-            total = #candidates
-            for _, row in ipairs(candidates) do
-                if shown >= limit then break end
-                shown = shown + 1
-                appendRow(row.name, row.desc, row.name:lower(), shown)
-            end
-        end
-        if shown == 0 then
-            addEmpty(mode == "Favorites" and "No favorites yet. Star a command to keep it here."
-                or "No commands found in this category. Try another search or tab.")
-        elseif total > shown then
-            local more = node("TextButton", listFrame, {
-                Name = "NOVA_LoadMore", LayoutOrder = shown + 1,
-                Size = UDim2.new(1, -5, 0, 36), BackgroundColor3 = theme.hover,
-                TextColor3 = theme.text, Font = Enum.Font.GothamSemibold,
-                TextSize = 12, ZIndex = 65,
-                Text = pageLimit >= 192 and "Refine search to see more results"
-                    or string.format("Load more  •  %d of %d shown", shown, total)
-            })
-            round(more, 8)
-            more.MouseButton1Click:Connect(function()
-                if pageLimit >= 192 then return end
-                local y = listFrame.CanvasPosition.Y
-                pageLimit = math.min(192, pageLimit + 48)
-                refreshList()
-                listFrame.CanvasPosition = Vector2.new(0, y)
-            end)
-        end
-        footerHint.Text = string.format("SHOWING %d / %d  •  ↑ / ↓ SELECT  •  ENTER TO EDIT  •  ESC TO CLOSE", shown, total)
-        if pageLimit == 48 then listFrame.CanvasPosition = Vector2.new(0, 0) end
-        local selected = nil
-        local selectedIndex = math.clamp(paletteSelectionIndex or 1, 1, math.max(1, shown))
-        paletteSelectionIndex = selectedIndex
-        for _, row in ipairs(listFrame:GetChildren()) do
-            if row:IsA("Frame") and row.Name == "NOVA_Row" then
-                row.BackgroundColor3 = row.LayoutOrder == selectedIndex and theme.hover or theme.bg
-                if row.LayoutOrder == selectedIndex then selected = row end
-            end
-        end
-    end
-
-    setPaletteVisible = function(state)
-        paletteOpen = state == true
-        overlay.Visible = paletteOpen
-        if paletteOpen then
-            resizePalette()
-            refreshList()
-            task.defer(function()
-                if paletteOpen then search:CaptureFocus() end
-            end)
-        else
-            search:ReleaseFocus()
-            commandInput:ReleaseFocus()
-        end
-    end
-    activatePalette = function(initialMode)
-        if initialMode then mode = initialMode end
-        setPaletteVisible(true)
-    end
-    close.MouseButton1Click:Connect(function() setPaletteVisible(false) end)
-    for tab, button in pairs(buttons) do
-        button.MouseButton1Click:Connect(function()
-            mode = tab
-            pageLimit = 48
-            if tab ~= "NOVA Additions" then group = "All" end
-            refreshList()
-        end)
-    end
-    for category, button in pairs(groupButtons) do
-        button.MouseButton1Click:Connect(function()
-            group = category
-            mode = "NOVA Additions"
-            pageLimit = 48
-            refreshList()
-        end)
-    end
-    local refreshToken = 0
-    local function listedRows()
-        local rows = {}
-        for _, item in ipairs(listFrame:GetChildren()) do
-            if item:IsA("Frame") and item.Name == "NOVA_Row" then
-                rows[#rows + 1] = item
-            end
-        end
-        table.sort(rows, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
-        return rows
-    end
-    local function movePaletteSelection(change)
-        local rows = listedRows()
-        if #rows == 0 then return end
-        paletteSelectionIndex = math.clamp(paletteSelectionIndex + change, 1, #rows)
-        for i, item in ipairs(rows) do
-            item.BackgroundColor3 = (i == paletteSelectionIndex) and theme.hover or theme.bg
-        end
-        local chosen = rows[paletteSelectionIndex]
-        if chosen and chosen.Parent then
-            -- Keep the selection visible without an expensive list rebuild.
-            local top = chosen.AbsolutePosition.Y - listFrame.AbsolutePosition.Y
-                + listFrame.CanvasPosition.Y
-            local y = listFrame.CanvasPosition.Y
-            if top < y then
-                listFrame.CanvasPosition = Vector2.new(0, math.max(0, top))
-            elseif top + chosen.AbsoluteSize.Y > y + listFrame.AbsoluteSize.Y then
-                listFrame.CanvasPosition = Vector2.new(0,
-                    math.max(0, top + chosen.AbsoluteSize.Y - listFrame.AbsoluteSize.Y))
-            end
-        end
-    end
-    search:GetPropertyChangedSignal("Text"):Connect(function()
-        paletteSelectionIndex = 1
-        refreshToken = refreshToken + 1
-        local token = refreshToken
-        pageLimit = 48
-        task.delay(0.075, function()
-            if token == refreshToken and paletteOpen then refreshList() end
-        end)
-    end)
-    search.FocusLost:Connect(function(submitted)
-        if submitted and paletteOpen then
-            local rows = listedRows()
-            local selected = rows[math.clamp(paletteSelectionIndex, 1, #rows)]
-            if selected then
-                local commandName = selected:GetAttribute("CommandText")
-                if commandName then
-                    selectCommand(commandName)
-                    commandInput:CaptureFocus()
-                end
-            end
-        end
-    end)
-    local function runPaletteCommand()
-        local chosen = commandInput.Text:gsub("^%s+", ""):gsub("%s+$", "")
-        if chosen == "" then
-            notify("NOVA Palette", "Select or type a command first.")
-            return
-        end
-        setPaletteVisible(false)
-        execCmd(chosen, localPlayer, true)
-    end
-    runButton.MouseButton1Click:Connect(runPaletteCommand)
-    commandInput.FocusLost:Connect(function(submitted)
-        if submitted and paletteOpen then runPaletteCommand() end
-    end)
-    editButton.MouseButton1Click:Connect(function()
-        local chosen = commandInput.Text
-        setPaletteVisible(false)
-        Cmdbar.Text = chosen
-        maximizeHolder()
-        Cmdbar:CaptureFocus()
-        Cmdbar.CursorPosition = #Cmdbar.Text + 1
-    end)
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if input.KeyCode == Enum.KeyCode.Escape and paletteOpen then
-            setPaletteVisible(false)
-            return
-        end
-        if paletteOpen and UserInputService:GetFocusedTextBox() == search then
-            if input.KeyCode == Enum.KeyCode.Down then
-                movePaletteSelection(1)
-                return
-            elseif input.KeyCode == Enum.KeyCode.Up then
-                movePaletteSelection(-1)
-                return
-            end
-        end
-        if gameProcessed or UserInputService:GetFocusedTextBox() then return end
-        if input.KeyCode == Enum.KeyCode.F2
-            or (input.KeyCode == Enum.KeyCode.K and
-                (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-                or UserInputService:IsKeyDown(Enum.KeyCode.RightControl))) then
-            setPaletteVisible(not paletteOpen)
-        end
-    end)
-
-    -- Lightweight FPS / memory / ping HUD (only runs while enabled).
-    local perfPanel = node("Frame", ScaledHolder, {
-        Name = "NOVA_PerformanceHUD", Visible = false,
-        Position = UDim2.new(0, 14, 0, 16), Size = UDim2.fromOffset(254, 100),
-        BackgroundColor3 = theme.bg, BackgroundTransparency = 0.08,
-        ZIndex = 30
-    })
-    round(perfPanel, 11)
-    local performanceTitle = node("TextLabel", perfPanel, {
-        Position = UDim2.fromOffset(12, 7), Size = UDim2.new(1, -22, 0, 23),
-        BackgroundTransparency = 1, Text = "NOVA  /  PERFORMANCE",
-        Font = Enum.Font.GothamBold, TextSize = 13,
-        TextColor3 = theme.accent, TextXAlignment = Enum.TextXAlignment.Left,
-        ZIndex = 31
-    })
-    local perfLabel = node("TextLabel", perfPanel, {
-        Position = UDim2.fromOffset(12, 32), Size = UDim2.new(1, -22, 0, 60),
-        BackgroundTransparency = 1, Text = "Collecting frame data...",
-        Font = Enum.Font.Code, TextSize = 14,
-        TextColor3 = theme.text, TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top,
-        ZIndex = 31
-    })
-    local fpsConnection
-    local frames, accumulated = 0, 0
-    local function setPerformance(enabled)
-        if fpsConnection then fpsConnection:Disconnect() fpsConnection = nil end
-        perfPanel.Visible = enabled
-        frames, accumulated = 0, 0
-        if enabled then
-            fpsConnection = RunService.RenderStepped:Connect(function(dt)
-                frames = frames + 1
-                accumulated = accumulated + dt
-                if accumulated < 0.65 then return end
-                local fps = math.floor(frames / accumulated + 0.5)
-                frames, accumulated = 0, 0
-                local ping = "n/a"
-                pcall(function() ping = string.format("%.0f ms", localPlayer:GetNetworkPing() * 1000) end)
-                local mem = "n/a"
-                pcall(function() mem = string.format("%.0f MB", StatsService:GetTotalMemoryUsageMb()) end)
-                perfLabel.Text = string.format("FPS     %d\nPing    %s\nMemory  %s", fps, ping, mem)
-            end)
-        end
-        return enabled
-    end
-
-    -- Persisted accessible accent presets + global GUI sizing.
-    local colorPresets = {
-        blue = Color3.fromRGB(101, 157, 255),
-        violet = Color3.fromRGB(163, 118, 255),
-        mint = Color3.fromRGB(85, 229, 175),
-        ember = Color3.fromRGB(255, 152, 99),
-    }
-    local function applyAccent(name)
-        name = tostring(name or "blue"):lower()
-        local color = colorPresets[name]
-        if not color then return false end
-        theme.accent = color
-        topAccent.BackgroundColor3 = color
-        local gradient = topAccent:FindFirstChildOfClass("UIGradient")
-        if gradient then gradient.Color = ColorSequence.new(color, theme.indigo) end
-        local runGradient = runButton:FindFirstChildOfClass("UIGradient")
-        if runGradient then runGradient.Color = ColorSequence.new(color, theme.indigo) end
-        runButton.BackgroundColor3 = color
-        listFrame.ScrollBarImageColor3 = color
-        local boxStroke = search:FindFirstChildOfClass("UIStroke")
-        if boxStroke then boxStroke.Color = color end
-        CMDsF.ScrollBarImageColor3 = color
-        store.appearance.theme = name
-        updateTabs()
-        saveSoon()
-        return true
-    end
-    -- Commands are registered after the original commands, preserving all of them.
-    local function showFavorites()
-        activatePalette("Favorites")
-    end
-    addcmd("palette", {"commandpalette", "nova"}, function()
-        activatePalette("All")
-        return "F2 or Ctrl+K opens the command palette."
-    end)
-    addcmd("iycore", {"originalcommands", "iycommands"}, function()
-        activatePalette("Infinite Yield")
-        return "Showing original Infinite Yield commands."
-    end)
-    addcmd("novaaddons", {"newcommands", "novacommands"}, function()
-        activatePalette("NOVA Additions")
-        return "Showing NOVA's new commands, separated from the original commands."
-    end)
-    addcmd("novagroup", {"commandgroup"}, function(args)
-        local name = tostring(args[1] or "All"):lower()
-        local groups = {all="All", gameplay="Gameplay", progression="Progression",
-            advanced="Advanced", utilities="Utilities", studio="Studio"}
-        if not groups[name] then return "Usage: novagroup [all/gameplay/progression/advanced/utilities/studio]" end
-        group = groups[name]
-        activatePalette("NOVA Additions")
-        return "Showing NOVA: " .. group
-    end)
-    addcmd("novatheme", {"novacolor"}, function(args)
-        local preset = tostring(args[1] or ""):lower()
-        if not applyAccent(preset) then return "Usage: novatheme [blue/violet/mint/ember]" end
-        return "NOVA theme: " .. preset
-    end)
-    addcmd("novascale", {"novaguiscale"}, function(args)
-        local n = tonumber(args[1])
-        if not n then return "Usage: novascale [0.8 to 1.25]" end
-        n = math.clamp(n, 0.8, 1.25)
-        if Scale then Scale.Scale = n end
-        store.appearance.scale = n
-        saveSoon()
-        resizePalette()
-        return "GUI scale: " .. string.format("%.2f", n)
-    end)
-    addcmd("refreshpalette", {"reindexcommands"}, function()
-        groupCacheCount = -1
-        refreshList()
-        return "Command groups reindexed."
-    end)
-    addcmd("favorites", {"favs"}, showFavorites)
-    addcmd("favorite", {"fav"}, function(args)
-        local name = normalizeName(args[1])
-        if not name then return "Usage: favorite [existing command]" end
-        if not favoriteIndex(name) then toggleFavorite(name) end
-        return "Favorited: " .. name
-    end)
-    addcmd("unfavorite", {"unfav"}, function(args)
-        local name = normalizeName(args[1])
-        if not name then return "Usage: unfavorite [existing command]" end
-        if favoriteIndex(name) then toggleFavorite(name) end
-        return "Removed favorite: " .. name
-    end)
-    addcmd("runfavorite", {"runfav"}, function(args)
-        local name = normalizeName(args[1])
-        if not name or not favoriteIndex(name) then return "That command is not in your favorites." end
-        local rest = table.concat(args, " ", 2)
-        -- Prevent runfavorite from recursively calling itself.
-        if name == "runfavorite" then return "Cannot invoke runfavorite recursively." end
-        execCmd(name .. (rest ~= "" and " " .. rest or ""), localPlayer, true)
-    end)
-    addcmd("clearfavorites", {"clearfavs"}, function()
-        store.favorites = {}
-        saveSoon()
-        refreshList()
-        if refreshQuickbar then refreshQuickbar() end
-        return "Favorites cleared."
-    end)
-    addcmd("cmdsearch", {"commandsearch"}, function(args)
-        search.Text = table.concat(args or {}, " ")
-        activatePalette("All")
-    end)
-    addcmd("cmdinfo", {"commandinfo"}, function(args)
-        local name = normalizeName(args[1])
-        if not name then return "Usage: cmdinfo [existing command]" end
-        local cmd = findCmd(name)
-        local aliasesText = table.concat(cmd.ALIAS or {}, ", ")
-        notify("Command: " .. name,
-            commandHelp(name) .. "\nAliases: " .. (aliasesText ~= "" and aliasesText or "none"), 14)
-    end)
-    addcmd("recentcmds", {"recentcommands"}, function()
-        activatePalette("Recent")
-    end)
-    addcmd("clearhistory", {"clearrecent"}, function()
-        store.recent = {}
-        cmdHistory = {}
-        saveSoon()
-        refreshList()
-        return "Command history cleared."
-    end)
-    addcmd("cmdstats", {"commandstats"}, function()
-        local sorted = {}
-        for name, count in pairs(store.counts) do
-            table.insert(sorted, {name = name, count = count})
-        end
-        table.sort(sorted, function(a, b) return a.count > b.count end)
-        local lines = {"Session dispatches: " .. sessionRuns}
-        for i = 1, math.min(#sorted, 5) do
-            table.insert(lines, string.format("%d. %s - %d", i, sorted[i].name, sorted[i].count))
-        end
-        notify("NOVA Command Analytics", table.concat(lines, "\n"), 15)
-    end)
-    addcmd("perfmon", {"performancehud", "performance"}, function()
-        return setPerformance(not perfPanel.Visible) and "Performance HUD enabled" or "Performance HUD disabled"
-    end)
-    addcmd("unperfmon", {"noperfmon"}, function()
-        setPerformance(false)
-        return "Performance HUD disabled"
-    end)
-    addcmd("sessioninfo", {"novainfo"}, function()
-        local elapsed = math.floor(os.clock() - sessionStart)
-        return string.format("Uptime %dm %ds | %d commands dispatched | %d favorites",
-            math.floor(elapsed / 60), elapsed % 60, sessionRuns, #store.favorites)
-    end)
-    addcmd("cmderrors", {"commanderrors"}, function()
-        local records = _G.IY_NOVA_ERRORS or {}
-        if #records == 0 then return "No command errors recorded this session." end
-        local parts = {}
-        for i = 1, math.min(3, #records) do
-            table.insert(parts, tostring(records[i].command) .. ": " .. tostring(records[i].message):sub(1, 80))
-        end
-        notify("Recent Command Errors (" .. #records .. ")", table.concat(parts, "\n"), 15)
-    end)
-    addcmd("clearcmderrors", {"clearcommanderrors"}, function()
-        _G.IY_NOVA_ERRORS = {}
-        return "Command errors cleared."
-    end)
-    addcmd("novacheck", {"novadiag", "novadiagnostics"}, function()
-        local saving = type(waxwritefile) == "function" and type(waxreadfile) == "function"
-        local clipboard = type(everyClipboard) == "function"
-        notify("NOVA Diagnostics",
-            string.format("Commands: %d | Plugins: %d\nFile persistence: %s\nClipboard: %s\nError records: %d",
-                #cmds, type(PluginsTable) == "table" and #PluginsTable or 0,
-                saving and "available" or "session-only", clipboard and "available" or "unavailable",
-                #(_G.IY_NOVA_ERRORS or {})), 12)
-    end)
-    addcmd("exportfavorites", {"copyfavorites"}, function()
-        if type(everyClipboard) ~= "function" then return "Clipboard API is unavailable." end
-        local raw = table.concat(store.favorites, "\n")
-        if raw == "" then return "No favorites to export." end
-        local ok = pcall(everyClipboard, raw)
-        return ok and "Copied favorites to clipboard." or "Clipboard write failed."
-    end)
-
-    -- Register the new commands with the original searchable command list too.
-    local addedHelp = {
-        {"palette / commandpalette / nova", "Open the NOVA command palette (F2 or Ctrl+K)."},
-        {"iycore / iycommands", "Browse original Infinite Yield commands only."},
-        {"novaaddons / novacommands", "Browse every new NOVA command separately."},
-        {"novagroup [category]", "Filter NOVA commands by Gameplay, Progression, Advanced, Utilities or Studio."},
-        {"refreshpalette", "Refresh the command source and category index."},
-        {"novatheme [color]", "Change accent to blue, violet, mint or ember (saved)."},
-        {"novascale [0.8-1.25]", "Resize NOVA and the compact IY GUI (saved)."},
-        {"favorites / favs", "Show commands you have starred."},
-        {"favorite / fav [command]", "Add a command to favorites."},
-        {"unfavorite / unfav [command]", "Remove a command from favorites."},
-        {"runfavorite / runfav [command] [args]", "Run a favorited command."},
-        {"clearfavorites / clearfavs", "Clear all favorited commands."},
-        {"cmdsearch [query]", "Search all commands from the palette."},
-        {"cmdinfo [command]", "Display a command description and aliases."},
-        {"recentcmds / recentcommands", "Browse recently executed commands."},
-        {"clearhistory / clearrecent", "Clear stored recent commands."},
-        {"cmdstats / commandstats", "Show command usage statistics."},
-        {"perfmon / performancehud", "Toggle the FPS, ping and memory monitor."},
-        {"unperfmon", "Close the performance monitor."},
-        {"sessioninfo / novainfo", "Show session uptime and dispatch count."},
-        {"cmderrors / commanderrors", "Show recent command failures."},
-        {"clearcmderrors", "Clear command error diagnostics."},
-        {"exportfavorites", "Copy your favorites to clipboard."},
-        {"novacheck / novadiag", "Check available APIs, commands and recent errors."},
-    }
-    for _, item in ipairs(addedHelp) do
-        addcmdtext(item[1], "NOVA", item[2])
-        local name = item[1]:match("^[%w_]+")
-        if name then helpMap[name:lower()] = item[2] end
-    end
-    if IsOnMobile then
-        local mobileButton = node("TextButton", ScaledHolder, {
-            Name = "NOVA_MobilePalette", Position = UDim2.fromOffset(12, 45),
-            Size = UDim2.fromOffset(54, 34), BackgroundColor3 = theme.accent,
-            BorderSizePixel = 0, Text = "NOVA", Font = Enum.Font.GothamBold,
-            TextColor3 = theme.bg, TextSize = 13, ZIndex = 25
-        })
-        round(mobileButton, 8)
-        mobileButton.MouseButton1Click:Connect(function()
-            setPaletteVisible(not paletteOpen)
-        end)
-    end
-    -- Polished compact legacy IY console. Keep its exact dimensions and layout
-    -- because existing settings, minimization and animations depend on them.
-    local function skinWidget(widget, radius, strokeColor)
-        if not widget or not widget.Parent then return end
-        if not widget:FindFirstChild("NOVA_Rounding") then
-            local corner = Instance.new("UICorner")
-            corner.Name = "NOVA_Rounding"
-            corner.CornerRadius = UDim.new(0, radius or 8)
-            corner.Parent = widget
-        end
-        if strokeColor and not widget:FindFirstChild("NOVA_Outline") then
-            local line = Instance.new("UIStroke")
-            line.Name = "NOVA_Outline"
-            line.Color = strokeColor
-            line.Transparency = 0.44
-            line.Thickness = 1
-            line.Parent = widget
-        end
-    end
-    Holder.BackgroundColor3 = theme.bg
-    Title.BackgroundColor3 = theme.panel
-    Dark.BackgroundColor3 = theme.bg
-    Cmdbar.Font = Enum.Font.Gotham
-    Cmdbar.TextSize = 14
-    Cmdbar.PlaceholderText = "Type a command  •  F2 for NOVA"
-    Cmdbar.TextColor3 = theme.text
-    CMDsF.ScrollBarImageColor3 = theme.accent
-    skinWidget(Holder, 11, theme.stroke)
-    skinWidget(Title, 9)
-    skinWidget(Settings, 9)
-    skinWidget(Notification, 10, theme.stroke)
-    skinWidget(Tooltip, 9)
-    local edge = Instance.new("UIGradient")
-    edge.Name = "NOVA_HeaderGradient"
-    edge.Color = ColorSequence.new(theme.panel, theme.hover)
-    edge.Rotation = 10
-    edge.Parent = Title
-    for _, iconButton in ipairs({SettingsButton, ReferenceButton}) do
-        pcall(function() iconButton.ImageColor3 = theme.accent end)
-    end
-    Title.Text = "✦   INFINITE YIELD  /  NOVA"
-    Title.TextSize = 13
-    Title.Font = Enum.Font.GothamBold
-    Title.TextXAlignment = Enum.TextXAlignment.Left
-    -- A visible, mobile-friendly shortcut to the significantly larger UI.
-    local launcher = node("TextButton", ScaledHolder, {
-        Name = "NOVA_Launcher", Position = UDim2.new(1, -182, 1, -262),
-        Size = UDim2.fromOffset(170, 33), BackgroundColor3 = theme.panel,
-        Text = "✦   NOVA COMMAND CENTER", Font = Enum.Font.GothamSemibold,
-        TextSize = 11, TextColor3 = theme.text, ZIndex = 32,
-        AutoButtonColor = true
-    })
-    skinWidget(launcher, 10, theme.stroke)
-    node("UIGradient", launcher, {Color = ColorSequence.new(theme.panel, theme.hover)})
-    launcher.MouseButton1Click:Connect(function() activatePalette("All") end)
-    pcall(function()
-        if Scale then Scale.Scale = math.clamp(store.appearance.scale or 1, 0.8, 1.25) end
-    end)
-    applyAccent(store.appearance.theme or "blue")
-    -- Pinned quick-access dock: compact buttons using *existing favorite names*.
-    -- No new per-frame work, and it follows the palette's persisted preferences.
-    local quickbar = node("Frame", ScaledHolder, {
-        Name = "NOVA_Quickbar", Visible = store.appearance.quickbar, Active = true,
-        Position = UDim2.new(0, 14, 0, 126), Size = UDim2.fromOffset(212, 44),
-        BackgroundColor3 = theme.bg, BackgroundTransparency = 0.04, ZIndex = 36
-    })
-    round(quickbar, 10)
-    dragGUI(quickbar)
-    node("UIStroke", quickbar, {Color = theme.stroke, Thickness = 1, Transparency = 0.2})
-    local qbTitle = node("TextLabel", quickbar, {
-        Name = "Title", Position = UDim2.fromOffset(9, 5), Size = UDim2.new(1, -36, 0, 20),
-        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
-        TextColor3 = theme.accent, TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "✦  NOVA QUICKBAR", ZIndex = 37
-    })
-    local qbClose = node("TextButton", quickbar, {
-        Name = "CloseQuickbar", Position = UDim2.new(1, -28, 0, 5),
-        Size = UDim2.fromOffset(22, 21), BackgroundColor3 = theme.hover,
-        TextColor3 = theme.text, Font = Enum.Font.GothamBold, TextSize = 16,
-        Text = "×", ZIndex = 37
-    })
-    round(qbClose, 6)
-    local function setQuickbar(enabled)
-        quickbar.Visible = enabled == true
-        store.appearance.quickbar = quickbar.Visible
-        saveSoon()
-        return quickbar.Visible
-    end
-    qbClose.MouseButton1Click:Connect(function() setQuickbar(false) end)
-    refreshQuickbar = function()
-        if not quickbar.Parent then return end
-        qbTitle.TextColor3 = theme.accent
-        for _, child in ipairs(quickbar:GetChildren()) do
-            if child:IsA("TextButton") and child.Name == "FavoriteRun" then child:Destroy() end
-            if child:IsA("TextLabel") and child.Name == "EmptyFavorites" then child:Destroy() end
-        end
-        local available = {}
-        for _, name in ipairs(store.favorites) do
-            if findCmd(name) then
-                available[#available + 1] = name
-                if #available >= 5 then break end
-            end
-        end
-        local count = #available
-        quickbar.Size = UDim2.fromOffset(212, count == 0 and 62 or (36 + count * 32))
-        if count == 0 then
-            node("TextLabel", quickbar, {
-                Name = "EmptyFavorites", Position = UDim2.fromOffset(8, 28),
-                Size = UDim2.new(1, -16, 0, 27), BackgroundTransparency = 1,
-                Text = "Star a command in the palette to pin it.",
-                TextColor3 = theme.muted, Font = Enum.Font.Gotham, TextSize = 11,
-                TextWrapped = true, ZIndex = 37
-            })
-            return
-        end
-        for i, name in ipairs(available) do
-            local target = name
-            local button = node("TextButton", quickbar, {
-                Name = "FavoriteRun", Position = UDim2.fromOffset(7, 28 + (i - 1) * 32),
-                Size = UDim2.new(1, -14, 0, 28),
-                BackgroundColor3 = theme.panel, TextColor3 = theme.text,
-                Text = string.format("★  %s", target), TextTruncate = Enum.TextTruncate.AtEnd,
-                Font = Enum.Font.GothamSemibold, TextSize = 12,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                ZIndex = 37
-            })
-            round(button, 6)
-            node("UIPadding", button, {PaddingLeft = UDim.new(0, 9)})
-            button.MouseButton1Click:Connect(function()
-                if findCmd(target) then execCmd(target, localPlayer, true) end
-            end)
-        end
-    end
-    refreshQuickbar()
-    addcmd("novaquickbar", {"nqbar"}, function(args)
-        local state = tostring(args[1] or "toggle"):lower()
-        if state == "off" or state == "hide" then setQuickbar(false)
-        elseif state == "on" or state == "show" then setQuickbar(true)
-        else setQuickbar(not quickbar.Visible) end
-        if quickbar.Visible then refreshQuickbar() end
-        return "Quickbar " .. (quickbar.Visible and "enabled" or "disabled") .. "."
-    end)
-    addcmdtext("novaquickbar [on/off]", "NOVA", "Pin your first five favorite commands in a movable-feeling compact dock.")
-    _G.IY_NOVA_UI = {
-        open = function(section) activatePalette(section or "All") end,
-        refresh = function() groupCacheCount = -1; refreshList() end,
-        category = commandGroup,
-        theme = applyAccent,
-        original = originalCommandNames,
-        counts = countGroups,
-        isOpen = function() return paletteOpen end,
-        quickbar = setQuickbar,
-        refreshQuickbar = refreshQuickbar,
-    }
-    IndexContents("", true)
-    if _G.IY_DEBUG then print("[NOVA] Extension loaded. F2 or Ctrl+K opens palette.") end
-end
-
---[[
-  INFINITE YIELD NOVA | GAMEPLAY COMMAND PACK
-  Additive and dependency-free. Commands are client-side; server authority may
-  override movement, interaction and character property changes.
-  Intentionally does not hook network remotes, spoof anti-cheat, or run HTTP code.
-]]
-do
-    local me = Players.LocalPlayer
-    local uis = UserInputService
-    local rs = RunService
-    local live = {}
-    local cns = {}
-    local registered = 0
-    local function unbind(id)
-        if cns[id] then cns[id]:Disconnect(); cns[id] = nil end
-    end
-    local function bind(id, signal, fn)
-        unbind(id)
-        cns[id] = signal:Connect(fn)
-    end
-    local function numeric(value, default, minimum, maximum)
-        local n = tonumber(value)
-        if not n or n ~= n or n == math.huge or n == -math.huge then n = default end
-        return math.clamp(n, minimum, maximum)
-    end
-    local function character()
-        local char = me.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local root = hum and hum.RootPart
-        if not (char and hum and root and hum.Health > 0) then return nil end
-        return char, hum, root
-    end
-    local function register(name, aliases, usage, description, fn)
-        if findCmd(name) then
-            warn("[NOVA gameplay] Skipping existing command:", name)
-            return
-        end
-        local safeAliases = {}
-        for _, alias in ipairs(aliases or {}) do
-            if not findCmd(alias) then table.insert(safeAliases, alias) end
-        end
-        addcmd(name, safeAliases, fn)
-        addcmdtext(usage or name, "NOVA GAMEPLAY", description)
-        registered = registered + 1
-    end
-    local function playerRoot(plr)
-        local char = plr.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local root = hum and hum.RootPart
-        if root and hum.Health > 0 then return root, hum, char end
-    end
-    local function sameTeam(plr)
-        return me.Team ~= nil and plr.Team == me.Team and not me.Neutral and not plr.Neutral
-    end
-    local function playerColor(plr)
-        return sameTeam(plr) and Color3.fromRGB(88, 220, 164) or Color3.fromRGB(255, 118, 115)
-    end
-    local function nearestPlayer(maxStuds, fieldOfViewPixels, includeFriends)
-        local _, _, root = character()
-        local camera = workspace.CurrentCamera
-        if not root or not camera then return nil end
-        local center = camera.ViewportSize * 0.5
-        local best, bestScore = nil, math.huge
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= me and (includeFriends or not sameTeam(plr)) then
-                local otherRoot = playerRoot(plr)
-                if otherRoot then
-                    local dist = (otherRoot.Position - root.Position).Magnitude
-                    if dist <= maxStuds then
-                        local p, onScreen = camera:WorldToViewportPoint(otherRoot.Position)
-                        local screenDist = (Vector2.new(p.X, p.Y) - center).Magnitude
-                        if onScreen and p.Z > 0 and screenDist < fieldOfViewPixels and screenDist < bestScore then
-                            best, bestScore = plr, screenDist
-                        end
-                    end
-                end
-            end
-        end
-        return best
-    end
-    local function getPlayerByName(raw)
-        if not raw then return nil end
-        local match = tostring(raw):lower()
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= me and (plr.Name:lower() == match or plr.DisplayName:lower() == match) then return plr end
-        end
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= me and (plr.Name:lower():sub(1, #match) == match or plr.DisplayName:lower():sub(1, #match) == match) then return plr end
-        end
-        return nil
-    end
-    local function decorate(frame, radius)
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, radius or 8)
-        corner.Parent = frame
-    end
-    local function textLabel(parent, content, pos, size, fontSize)
-        local label = Instance.new("TextLabel")
-        label.BackgroundTransparency = 1
-        label.Text = content
-        label.Font = Enum.Font.GothamMedium
-        label.TextColor3 = Color3.fromRGB(233, 240, 252)
-        label.TextSize = fontSize or 13
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Position = pos
-        label.Size = size
-        label.Parent = parent
-        return label
-    end
-    -- Movement powers ---------------------------------------------------------
-    local function directionalDash(direction, length)
-        local char, _, root = character()
-        if not root then return "Dash unavailable: character not ready." end
-        local forward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-        local right = Vector3.new(root.CFrame.RightVector.X, 0, root.CFrame.RightVector.Z)
-        if forward.Magnitude < 0.01 then return "Dash unavailable: no forward direction." end
-        forward, right = forward.Unit, right.Unit
-        local vec = (direction == "back" and -forward)
-            or (direction == "left" and -right)
-            or (direction == "right" and right) or forward
-        local requested = numeric(length, 18, 2, 45)
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = {char}
-        params.IgnoreWater = true
-        local hit = workspace:Raycast(root.Position + Vector3.new(0, 1, 0), vec * requested, params)
-        local travelled = hit and math.max(0, (hit.Position - (root.Position + Vector3.new(0, 1, 0))).Magnitude - 3) or requested
-        if travelled < 1 then return "Dash blocked by a nearby obstacle." end
-        char:PivotTo(char:GetPivot() + vec * travelled)
-        return string.format("%s dash: %.0f studs", direction, travelled)
-    end
-    register("dash", {"forwarddash"}, "dash [studs]", "Short forward dash with obstruction checking (2-45 studs).", function(a)
-        return directionalDash("forward", a[1])
-    end)
-    register("backdash", {}, "backdash [studs]", "Dash backwards without intentionally passing through walls.", function(a)
-        return directionalDash("back", a[1])
-    end)
-    register("leftdash", {}, "leftdash [studs]", "Quick sideways dash to the left.", function(a)
-        return directionalDash("left", a[1])
-    end)
-    register("rightdash", {}, "rightdash [studs]", "Quick sideways dash to the right.", function(a)
-        return directionalDash("right", a[1])
-    end)
-    register("longjump", {"leap"}, "longjump [horizontal] [vertical]", "Launch forward with configurable horizontal/vertical velocity.", function(a)
-        local _, hum, root = character()
-        if not root then return "Character not ready." end
-        local horizontal = numeric(a[1], 67, 10, 130)
-        local vertical = numeric(a[2], 52, 10, 110)
-        local face = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-        if face.Magnitude < 0.01 then return "No forward direction." end
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        root.AssemblyLinearVelocity = face.Unit * horizontal + Vector3.new(0, vertical, 0)
-        return string.format("Long jump: %.0f horizontal / %.0f vertical", horizontal, vertical)
-    end)
-    register("superjump", {"skyjump"}, "superjump [power]", "Single high jump, without changing permanent JumpPower.", function(a)
-        local _, hum, root = character()
-        if not root then return "Character not ready." end
-        local power = numeric(a[1], 100, 35, 150)
-        local v = root.AssemblyLinearVelocity
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        root.AssemblyLinearVelocity = Vector3.new(v.X, power, v.Z)
-        return "Super jump launched."
-    end)
-
-    local jumps = {enabled = false, extra = 1, spent = 0, last = 0, lastGrounded = os.clock()}
-    local function stopMultiJump()
-        jumps.enabled = false; jumps.spent = 0
-        unbind("multiJump")
-        unbind("multiJumpGround")
-    end
-    register("multijump", {"doublejump"}, "multijump [extra jumps]", "Allow 1-3 additional jumps in midair (default 1).", function(a)
-        stopMultiJump()
-        jumps.extra = math.floor(numeric(a[1], 1, 1, 3))
-        jumps.enabled = true
-        bind("multiJumpGround", rs.Heartbeat, function()
-            local _, hum = character()
-            if hum and hum.FloorMaterial ~= Enum.Material.Air then
-                jumps.spent = 0
-                jumps.lastGrounded = os.clock()
-            end
-        end)
-        bind("multiJump", uis.JumpRequest, function()
-            local _, hum, root = character()
-            if not hum or not jumps.enabled then return end
-            if hum.FloorMaterial ~= Enum.Material.Air then
-                jumps.spent = 0
-                return
-            end
-            if os.clock() - jumps.lastGrounded < 0.15 or
-                os.clock() - jumps.last < 0.18 or jumps.spent >= jumps.extra then return end
-            jumps.spent = jumps.spent + 1
-            jumps.last = os.clock()
-            local v = root.AssemblyLinearVelocity
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-            root.AssemblyLinearVelocity = Vector3.new(v.X, math.max(v.Y, 49), v.Z)
-        end)
-        return "Multi-jump enabled (" .. jumps.extra .. " additional jump(s))."
-    end)
-    register("unmultijump", {"undoublejump"}, "unmultijump", "Disable additional midair jumps.", function()
-        stopMultiJump(); return "Multi-jump disabled."
-    end)
-    register("togglemultijump", {"toggledoublejump"}, "togglemultijump", "Toggle midair jumps.", function()
-        if jumps.enabled then stopMultiJump(); return "Multi-jump disabled." end
-        execCmd("multijump " .. jumps.extra, me)
-        return "Multi-jump enabled."
-    end)
-
-    local hop = {enabled = false, last = 0}
-    local function setHop(enabled)
-        hop.enabled = enabled
-        unbind("hop")
-        if enabled then
-            bind("hop", rs.Heartbeat, function()
-                local _, hum = character()
-                if not hum or hum.Sit or hum.MoveDirection.Magnitude < 0.1 then return end
-                if hum.FloorMaterial ~= Enum.Material.Air and os.clock() - hop.last >= 0.13 then
-                    hop.last = os.clock()
-                    hum.Jump = true
-                end
-            end)
-        end
-    end
-    register("bunnyhop", {"bhop"}, "bunnyhop", "Automatically jump when running on the ground.", function()
-        setHop(true); return "Bunny hop enabled."
-    end)
-    register("unbunnyhop", {"unbhop"}, "unbunnyhop", "Disable automatic bunny hopping.", function()
-        setHop(false); return "Bunny hop disabled."
-    end)
-    register("togglebunnyhop", {"togglebhop"}, "togglebunnyhop", "Toggle bunny hopping.", function()
-        setHop(not hop.enabled); return "Bunny hop " .. (hop.enabled and "enabled." or "disabled.")
-    end)
-
-    local glide = {enabled = false, limit = 9}
-    local function setGlide(enabled)
-        glide.enabled = enabled
-        unbind("glide")
-        if enabled then
-            bind("glide", rs.Heartbeat, function()
-                local _, hum, root = character()
-                if hum and hum.FloorMaterial == Enum.Material.Air and not hum.Sit then
-                    local v = root.AssemblyLinearVelocity
-                    if v.Y < -glide.limit then
-                        root.AssemblyLinearVelocity = Vector3.new(v.X, -glide.limit, v.Z)
-                    end
-                end
-            end)
-        end
-    end
-    register("glide", {"slowfall"}, "glide [max fall speed]", "Limit downward velocity while airborne (default 9).", function(a)
-        glide.limit = numeric(a[1], 9, 2, 35)
-        setGlide(true); return "Glide enabled."
-    end)
-    register("unglide", {"unslowfall"}, "unglide", "Disable fall-speed limiting.", function()
-        setGlide(false); return "Glide disabled."
-    end)
-    register("toggleglide", {}, "toggleglide", "Toggle glide mode.", function()
-        setGlide(not glide.enabled); return "Glide " .. (glide.enabled and "enabled." or "disabled.")
-    end)
-
-    local climb = {enabled = false, speed = 18}
-    local function setClimb(enabled)
-        climb.enabled = enabled
-        unbind("climb")
-        if enabled then
-            bind("climb", rs.Heartbeat, function()
-                local char, hum, root = character()
-                if not root or hum.Sit or not uis:IsKeyDown(Enum.KeyCode.Space) then return end
-                local params = RaycastParams.new()
-                params.FilterType = Enum.RaycastFilterType.Exclude
-                params.FilterDescendantsInstances = {char}
-                params.IgnoreWater = true
-                local hit = workspace:Raycast(root.Position, root.CFrame.LookVector * 3, params)
-                if hit and math.abs(hit.Normal.Y) < 0.35 then
-                    local v = root.AssemblyLinearVelocity
-                    root.AssemblyLinearVelocity = Vector3.new(v.X, math.max(v.Y, climb.speed), v.Z)
-                end
-            end)
-        end
-    end
-    register("wallclimb", {"spiderclimb"}, "wallclimb [speed]", "Hold Space against a near-vertical wall to climb.", function(a)
-        climb.speed = numeric(a[1], 18, 5, 45)
-        setClimb(true); return "Wall climb enabled (Space near a wall)."
-    end)
-    register("unwallclimb", {"unspiderclimb"}, "unwallclimb", "Disable wall climbing.", function()
-        setClimb(false); return "Wall climb disabled."
-    end)
-    register("togglewallclimb", {}, "togglewallclimb", "Toggle wall climb.", function()
-        setClimb(not climb.enabled); return "Wall climb " .. (climb.enabled and "enabled." or "disabled.")
-    end)
-
-    local burst = {token = 0, humanoid = nil, original = nil, active = false, speed = nil}
-    local sprint = {enabled = false, locked = false, speed = 31, original = nil, activeHum = nil}
-    local function restoreSprint()
-        if sprint.activeHum and sprint.activeHum.Parent and sprint.original then
-            -- Do not undo a speed change made by another command.
-            if math.abs(sprint.activeHum.WalkSpeed - sprint.speed) < 0.01 then
-                sprint.activeHum.WalkSpeed = sprint.original
-            end
-        end
-        sprint.original = nil
-        sprint.activeHum = nil
-    end
-    local function tickSprint()
-        if burst.active then return end
-        local _, hum = character()
-        local shouldSprint = sprint.enabled and hum and (sprint.locked
-            or uis:IsKeyDown(Enum.KeyCode.LeftShift) or uis:IsKeyDown(Enum.KeyCode.RightShift))
-        if not shouldSprint then restoreSprint(); return end
-        if sprint.activeHum ~= hum then
-            restoreSprint()
-            sprint.activeHum, sprint.original = hum, hum.WalkSpeed
-        end
-        if math.abs(hum.WalkSpeed - sprint.speed) > 0.01 then
-            -- External speed modifiers take precedence if changed during sprint.
-            if sprint.original ~= nil and hum.WalkSpeed ~= sprint.original then
-                sprint.original = hum.WalkSpeed
-            end
-            hum.WalkSpeed = sprint.speed
-        end
-    end
-    local function setSprint(enabled, locked)
-        sprint.enabled = enabled
-        sprint.locked = locked or false
-        unbind("sprint")
-        if enabled then
-            bind("sprint", rs.Heartbeat, function()
-                local now = os.clock()
-                if not sprint.last or now - sprint.last >= 0.09 then
-                    sprint.last = now
-                    tickSprint()
-                end
-            end)
-        else
-            restoreSprint()
-        end
-    end
-    register("sprint", {"shiftsprint"}, "sprint [speed]", "Hold Shift for temporary run speed (default 31).", function(a)
-        if sprint.enabled then restoreSprint() end
-        sprint.speed = numeric(a[1], 31, 17, 150)
-        setSprint(true, false); return "Shift-sprint enabled."
-    end)
-    register("sprintlock", {"alwayssprint"}, "sprintlock [speed]", "Run faster continuously without holding Shift.", function(a)
-        if sprint.enabled then restoreSprint() end
-        sprint.speed = numeric(a[1], 31, 17, 150)
-        setSprint(true, true); return "Sprint lock enabled."
-    end)
-    register("unsprint", {"unsprintlock", "noshiftsprint"}, "unsprint", "Disable both sprint modes and restore original speed.", function()
-        setSprint(false, false); return "Sprint disabled."
-    end)
-    register("togglesprint", {}, "togglesprint", "Toggle Shift sprint at the previously chosen speed.", function()
-        setSprint(not sprint.enabled, false)
-        return "Shift sprint " .. (sprint.enabled and "enabled." or "disabled.")
-    end)
-
-    register("speedburst", {"burstspeed"}, "speedburst [speed] [seconds]", "Temporary speed boost with automatic restoration.", function(a)
-        local _, hum = character()
-        if not hum then return "Character not ready." end
-        local speed = numeric(a[1], 60, 18, 160)
-        local seconds = numeric(a[2], 3, 0.25, 15)
-        local baseline
-        if burst.active and burst.humanoid == hum then
-            baseline = burst.original
-        else
-            restoreSprint()
-            baseline = hum.WalkSpeed
-        end
-        burst.token = burst.token + 1
-        local ownToken = burst.token
-        burst.humanoid, burst.original = hum, baseline
-        burst.speed, burst.active = speed, true
-        hum.WalkSpeed = speed
-        task.delay(seconds, function()
-            if ownToken ~= burst.token then return end
-            if hum.Parent and math.abs(hum.WalkSpeed - speed) < 0.01 then
-                hum.WalkSpeed = baseline
-            end
-            burst.active = false
-            burst.humanoid, burst.original, burst.speed = nil, nil, nil
-        end)
-        return string.format("Speed burst %.0f for %.1fs.", speed, seconds)
-    end)
-
-    -- Player ESP --------------------------------------------------------------
-    local tracers = {enabled = false, range = 600, container = nil, items = {}, revision = 0}
-    local function stopTracers()
-        tracers.enabled = false
-        tracers.revision = tracers.revision + 1
-        for _, line in pairs(tracers.items) do line:Destroy() end
-        table.clear(tracers.items)
-        if tracers.container then tracers.container:Destroy(); tracers.container = nil end
-        unbind("tracers")
-    end
-    local function enableTracers()
-        stopTracers()
-        tracers.enabled = true
-        local overlay = Instance.new("Frame")
-        overlay.Name = "NOVA_GameplayTracers"
-        overlay.Size = UDim2.fromScale(1, 1)
-        overlay.BackgroundTransparency = 1
-        overlay.Active = false
-        overlay.ZIndex = 35
-        overlay.Parent = ScaledHolder
-        tracers.container = overlay
-        local accumulated = 0
-        bind("tracers", rs.RenderStepped, function(dt)
-            accumulated = accumulated + dt
-            if accumulated < 0.05 then return end
-            accumulated = 0
-            local camera = workspace.CurrentCamera
-            local _, _, myRoot = character()
-            if not camera or not myRoot then return end
-            local viewport = camera.ViewportSize
-            local origin = Vector2.new(viewport.X * 0.5, viewport.Y * 0.87)
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= me then
-                    local other = playerRoot(plr)
-                    local point, onScreen
-                    if other then point, onScreen = camera:WorldToScreenPoint(other.Position) end
-                    local distance = other and (other.Position - myRoot.Position).Magnitude or math.huge
-                    local visible = onScreen and point.Z > 0 and distance <= tracers.range
-                    local line = tracers.items[plr]
-                    if visible then
-                        if not line then
-                            line = Instance.new("Frame")
-                            line.Name = "Tracer_" .. plr.UserId
-                            line.AnchorPoint = Vector2.new(0, 0.5)
-                            line.BorderSizePixel = 0
-                            line.ZIndex = 36
-                            line.Parent = overlay
-                            tracers.items[plr] = line
-                        end
-                        local target = Vector2.new(point.X, point.Y)
-                        local diff = target - origin
-                        line.Position = UDim2.fromOffset(origin.X, origin.Y)
-                        line.Size = UDim2.fromOffset(diff.Magnitude, 2)
-                        line.Rotation = math.deg(math.atan2(diff.Y, diff.X))
-                        line.BackgroundColor3 = playerColor(plr)
-                        line.Visible = true
-                    elseif line then
-                        line.Visible = false
-                    end
-                end
-            end
-            for plr, line in pairs(tracers.items) do
-                if plr.Parent ~= Players then line:Destroy(); tracers.items[plr] = nil end
-            end
-        end)
-    end
-    register("tracers", {"playertracers"}, "tracers [max distance]", "Draw team-colored 2D lines to nearby players.", function(a)
-        tracers.range = numeric(a[1], 600, 25, 2500)
-        enableTracers(); return "Player tracers enabled."
-    end)
-    register("untracers", {"notracers"}, "untracers", "Remove all player tracer lines and the update connection.", function()
-        stopTracers(); return "Player tracers disabled."
-    end)
-    register("toggletracers", {}, "toggletracers", "Toggle player tracers.", function()
-        if tracers.enabled then stopTracers() else enableTracers() end
-        return "Tracers " .. (tracers.enabled and "enabled." or "disabled.")
-    end)
-
-    local radar = {enabled = false, range = 160, frame = nil, dots = {}}
-    local function stopRadar()
-        radar.enabled = false
-        unbind("radar")
-        if radar.frame then radar.frame:Destroy(); radar.frame = nil end
-        table.clear(radar.dots)
-    end
-    local function enableRadar()
-        stopRadar()
-        radar.enabled = true
-        local panel = Instance.new("Frame")
-        panel.Name = "NOVA_GameplayRadar"
-        panel.Size = UDim2.fromOffset(222, 244)
-        panel.Position = UDim2.new(1, -239, 0, 20)
-        panel.BackgroundColor3 = Color3.fromRGB(20, 27, 39)
-        panel.BackgroundTransparency = 0.07
-        panel.BorderSizePixel = 0
-        panel.ZIndex = 44
-        panel.Parent = ScaledHolder
-        decorate(panel, 10)
-        textLabel(panel, "NOVA  /  PLAYER RADAR", UDim2.fromOffset(12, 7), UDim2.fromOffset(202, 23), 13).ZIndex = 45
-        local circle = Instance.new("Frame")
-        circle.Name = "RadarDisplay"
-        circle.Size = UDim2.fromOffset(190, 190)
-        circle.Position = UDim2.fromOffset(16, 34)
-        circle.BackgroundColor3 = Color3.fromRGB(30, 41, 56)
-        circle.BorderSizePixel = 0
-        circle.ClipsDescendants = true
-        circle.ZIndex = 45
-        circle.Parent = panel
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(1, 0)
-        corner.Parent = circle
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(92, 117, 156)
-        stroke.Transparency = 0.25
-        stroke.Parent = circle
-        local selfDot = Instance.new("Frame")
-        selfDot.Size = UDim2.fromOffset(9, 9)
-        selfDot.AnchorPoint = Vector2.new(0.5, 0.5)
-        selfDot.Position = UDim2.fromOffset(95, 95)
-        selfDot.BackgroundColor3 = Color3.fromRGB(110, 165, 255)
-        selfDot.BorderSizePixel = 0
-        selfDot.ZIndex = 47
-        selfDot.Parent = circle
-        decorate(selfDot, 10)
-        radar.frame = panel
-        local elapsed = 0
-        bind("radar", rs.Heartbeat, function(dt)
-            elapsed = elapsed + dt
-            if elapsed < 0.1 then return end
-            elapsed = 0
-            local _, _, root = character()
-            if not root then return end
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= me then
-                    local other = playerRoot(plr)
-                    local dot = radar.dots[plr]
-                    if other then
-                        if not dot then
-                            dot = Instance.new("Frame")
-                            dot.Name = "Radar_" .. plr.UserId
-                            dot.Size = UDim2.fromOffset(7, 7)
-                            dot.AnchorPoint = Vector2.new(0.5, 0.5)
-                            dot.BorderSizePixel = 0
-                            dot.ZIndex = 46
-                            dot.Parent = circle
-                            decorate(dot, 7)
-                            radar.dots[plr] = dot
-                        end
-                        local relative = root.CFrame:VectorToObjectSpace(other.Position - root.Position)
-                        local horizontal = Vector2.new(relative.X, relative.Z)
-                        local dist = horizontal.Magnitude
-                        dot.Visible = dist <= radar.range
-                        if dot.Visible then
-                            dot.Position = UDim2.fromOffset(95 + horizontal.X / radar.range * 90,
-                                95 + horizontal.Y / radar.range * 90)
-                            dot.BackgroundColor3 = playerColor(plr)
-                        end
-                    elseif dot then
-                        dot.Visible = false
-                    end
-                end
-            end
-            for plr, dot in pairs(radar.dots) do
-                if plr.Parent ~= Players then dot:Destroy(); radar.dots[plr] = nil end
-            end
-        end)
-    end
-    register("radar", {"playerradar"}, "radar [range]", "Compact top-down player radar; green teammates and red others.", function(a)
-        radar.range = numeric(a[1], 160, 25, 1500)
-        enableRadar(); return "Player radar enabled."
-    end)
-    register("unradar", {"noradar"}, "unradar", "Close player radar and disconnect its loop.", function()
-        stopRadar(); return "Player radar disabled."
-    end)
-    register("toggleradar", {}, "toggleradar", "Toggle the player radar.", function()
-        if radar.enabled then stopRadar() else enableRadar() end
-        return "Player radar " .. (radar.enabled and "enabled." or "disabled.")
-    end)
-
-    local tags = {enabled = false, range = 450, revision = 0, items = {}}
-    local function stopTags()
-        tags.enabled = false
-        tags.revision = tags.revision + 1
-        for _, gui in pairs(tags.items) do gui:Destroy() end
-        table.clear(tags.items)
-    end
-    local function enableTags()
-        stopTags()
-        tags.enabled = true
-        tags.revision = tags.revision + 1
-        local thisRevision = tags.revision
-        task.spawn(function()
-            while tags.enabled and thisRevision == tags.revision do
-                local _, _, root = character()
-                for _, plr in ipairs(Players:GetPlayers()) do
-                    if plr ~= me then
-                        local theirRoot, hum, char = playerRoot(plr)
-                        local head = char and char:FindFirstChild("Head")
-                        local current = tags.items[plr]
-                        if current and (not head or current.Adornee ~= head) then
-                            current:Destroy(); tags.items[plr] = nil; current = nil
-                        end
-                        local distance = root and theirRoot and (theirRoot.Position - root.Position).Magnitude or math.huge
-                        if head and distance <= tags.range then
-                            if not current then
-                                current = Instance.new("BillboardGui")
-                                current.Name = "NOVA_PlayerTag"
-                                current.Size = UDim2.fromOffset(200, 40)
-                                current.StudsOffsetWorldSpace = Vector3.new(0, 2.3, 0)
-                                current.AlwaysOnTop = true
-                                current.Adornee = head
-                                current.Parent = head
-                                local t = textLabel(current, "", UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), 13)
-                                t.Name = "Text"
-                                t.TextXAlignment = Enum.TextXAlignment.Center
-                                t.TextStrokeTransparency = 0.35
-                                tags.items[plr] = current
-                            end
-                            local label = current:FindFirstChild("Text")
-                            if label then
-                                label.Text = string.format("%s   %.0f studs   %d HP", plr.DisplayName,
-                                    distance, math.ceil(hum.Health))
-                                label.TextColor3 = playerColor(plr)
-                            end
-                            current.Enabled = true
-                        elseif current then current.Enabled = false end
-                    end
-                end
-                for plr, gui in pairs(tags.items) do
-                    if plr.Parent ~= Players then gui:Destroy(); tags.items[plr] = nil end
-                end
-                task.wait(0.25)
-            end
-        end)
-    end
-    register("distancetags", {"playerlabels"}, "distancetags [range]", "Overhead player distance and health labels (client-side).", function(a)
-        tags.range = numeric(a[1], 450, 20, 1500)
-        enableTags(); return "Player distance tags enabled."
-    end)
-    register("undistancetags", {"unplayerlabels"}, "undistancetags", "Remove player distance labels.", function()
-        stopTags(); return "Player distance tags disabled."
-    end)
-    register("toggledistancetags", {}, "toggledistancetags", "Toggle the overhead player labels.", function()
-        if tags.enabled then stopTags() else enableTags() end
-        return "Distance tags " .. (tags.enabled and "enabled." or "disabled.")
-    end)
-
-    local toolESP = {enabled = false, items = {}, revision = 0}
-    local function stopToolESP()
-        toolESP.enabled = false
-        toolESP.revision = toolESP.revision + 1
-        unbind("toolESP")
-        for _, obj in pairs(toolESP.items) do obj:Destroy() end
-        table.clear(toolESP.items)
-    end
-    local function highlightTool(tool)
-        if not toolESP.enabled or not tool:IsA("Tool") or not tool:IsDescendantOf(workspace) then return end
-        if tool.Parent and tool.Parent:IsA("Model") and Players:GetPlayerFromCharacter(tool.Parent) then return end
-        if toolESP.items[tool] then return end
-        local n = 0
-        for _ in pairs(toolESP.items) do n = n + 1 end
-        if n >= 120 then return end
-        local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart", true)
-        if not handle then return end
-        local high = Instance.new("Highlight")
-        high.Name = "NOVA_ToolHighlight"
-        high.Adornee = handle
-        high.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        high.FillColor = Color3.fromRGB(255, 213, 101)
-        high.OutlineColor = Color3.fromRGB(255, 246, 181)
-        high.FillTransparency = 0.72
-        high.Parent = handle
-        toolESP.items[tool] = high
-    end
-    local function enableToolESP()
-        stopToolESP()
-        toolESP.enabled = true
-        toolESP.revision = toolESP.revision + 1
-        local revision = toolESP.revision
-        bind("toolESP", workspace.DescendantAdded, function(obj)
-            if obj:IsA("Tool") then
-                task.defer(function() if revision == toolESP.revision then highlightTool(obj) end end)
-            elseif obj:IsA("BasePart") and obj.Parent and obj.Parent:IsA("Tool") then
-                task.defer(function() if revision == toolESP.revision then highlightTool(obj.Parent) end end)
-            end
-        end)
-        task.spawn(function()
-            local all = workspace:GetDescendants()
-            for i, obj in ipairs(all) do
-                if revision ~= toolESP.revision then return end
-                if obj:IsA("Tool") then highlightTool(obj) end
-                if i % 300 == 0 then task.wait() end
-            end
-            while revision == toolESP.revision do
-                for tool, marker in pairs(toolESP.items) do
-                    if not tool.Parent or not tool:IsDescendantOf(workspace) or
-                        (tool.Parent and tool.Parent:IsA("Model") and Players:GetPlayerFromCharacter(tool.Parent)) or not marker.Parent then
-                        marker:Destroy(); toolESP.items[tool] = nil
-                    end
-                end
-                task.wait(1)
-            end
-        end)
-    end
-    register("toolesp", {"itemesp"}, "toolesp", "Highlight dropped Tools in the workspace (max 120).", function()
-        enableToolESP(); return "Dropped-tool ESP enabled."
-    end)
-    register("untoolesp", {"unitemesp"}, "untoolesp", "Remove dropped Tool highlights.", function()
-        stopToolESP(); return "Dropped-tool ESP disabled."
-    end)
-    register("toggletoolesp", {}, "toggletoolesp", "Toggle Tool ESP.", function()
-        if toolESP.enabled then stopToolESP() else enableToolESP() end
-        return "Tool ESP " .. (toolESP.enabled and "enabled." or "disabled.")
-    end)
-    register("nearbyplayers", {"nearestplayers"}, "nearbyplayers [radius]", "List up to 8 players sorted by distance.", function(a)
-        local _, _, root = character()
-        if not root then return "Character not ready." end
-        local radius = numeric(a[1], 250, 10, 2500)
-        local list = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= me then
-                local other = playerRoot(plr)
-                if other then
-                    local distance = (other.Position - root.Position).Magnitude
-                    if distance <= radius then table.insert(list, {player = plr, distance = distance}) end
-                end
-            end
-        end
-        table.sort(list, function(a, b) return a.distance < b.distance end)
-        if #list == 0 then return "No players within " .. math.floor(radius) .. " studs." end
-        local lines = {}
-        for i = 1, math.min(#list, 8) do
-            local item = list[i]
-            table.insert(lines, string.format("%s: %d studs", item.player.Name, item.distance))
-        end
-        notify("Nearby players (" .. #list .. ")", table.concat(lines, "\n"), 12)
-    end)
-
-    -- Optional aim camera assist: only with right mouse held. Does not fire tools.
-    local aim = {enabled = false, target = nil, maxDist = 300}
-    local function stopAim()
-        aim.enabled = false
-        aim.target = nil
-        pcall(function() rs:UnbindFromRenderStep("NOVA_AimCamera") end)
-    end
-    local function startAim()
-        stopAim()
-        aim.enabled = true
-        rs:BindToRenderStep("NOVA_AimCamera", Enum.RenderPriority.Camera.Value + 1, function(dt)
-            if not aim.enabled or not uis:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return end
-            if uis:GetFocusedTextBox() then return end
-            local camera = workspace.CurrentCamera
-            local _, _, root = character()
-            if not camera or not root then return end
-            local target = aim.target or nearestPlayer(aim.maxDist, 230, false)
-            local targetRoot, _, targetChar = target and playerRoot(target)
-            if not targetRoot or (targetRoot.Position - root.Position).Magnitude > aim.maxDist then return end
-            local head = targetChar:FindFirstChild("Head") or targetRoot
-            local goal = CFrame.lookAt(camera.CFrame.Position, head.Position)
-            local alpha = 1 - math.pow(0.8, math.clamp(dt, 0, 0.1) * 60)
-            camera.CFrame = camera.CFrame:Lerp(goal, alpha)
-        end)
-    end
-    register("aimassist", {"aimlock"}, "aimassist [closest|player] [max distance]", "Smooth camera lock while holding right mouse; no autofire.", function(a)
-        local name = a[1]
-        local requestedTarget = name and name:lower() ~= "closest" and getPlayerByName(name) or nil
-        if name and name:lower() ~= "closest" and not requestedTarget then
-            return "Player not found: " .. tostring(name)
-        end
-        aim.target = requestedTarget
-        aim.maxDist = numeric(a[2], 300, 30, 1200)
-        -- startAim resets the target; capture it first.
-        local selected = aim.target
-        startAim()
-        aim.target = selected
-        return "Aim assist enabled (hold right mouse)."
-    end)
-    register("unaimassist", {"unaimlock"}, "unaimassist", "Remove camera aim assist.", function()
-        stopAim(); return "Aim assist disabled."
-    end)
-    register("toggleaimassist", {}, "toggleaimassist", "Toggle right-mouse aim assist.", function()
-        if aim.enabled then stopAim() else startAim() end
-        return "Aim assist " .. (aim.enabled and "enabled." or "disabled.")
-    end)
-
-    -- Lifecycle and help ------------------------------------------------------
-    me.CharacterAdded:Connect(function()
-        jumps.spent = 0
-        jumps.lastGrounded = os.clock()
-        burst.token = burst.token + 1
-        burst.active = false
-        burst.humanoid, burst.original, burst.speed = nil, nil, nil
-        sprint.original, sprint.activeHum = nil, nil
-    end)
-    register("gameplayhelp", {"novacheats"}, "gameplayhelp", "Show all gameplay extension commands by category.", function()
-        notify("NOVA Gameplay: " .. registered .. " commands", 
-            "Movement: dash, longjump, superjump, multijump, bunnyhop, sprint, glide, wallclimb, speedburst\n"
-            .. "ESP: tracers, radar, distancetags, toolesp, nearbyplayers\n"
-            .. "Camera: aimassist [closest|player] [range]\n"
-            .. "Use F2 or Ctrl+K to search any command.", 17)
-        return nil
-    end)
-    IndexContents("", true)
-    if _G.IY_DEBUG then print("[NOVA gameplay] Added", registered, "gameplay commands") end
-end
-
-
---[[
-    INFINITE YIELD NOVA | PROGRESSION LAB
-    A client-observable objective explorer and confirmed-collection autopilot.
-    Integrates with the existing IY command registry; no remote guessing,
-    purchase automation, anti-cheat bypass, or claims of server-side rewards.
-]]
-do
-    local player = Players.LocalPlayer
-    local http = HttpService
-    local run = RunService
-    local world = workspace
-    local PROG = {
-        running = false, paused = false, farm = false, token = 0,
-        candidates = {}, scanGeneration = 0, scanActive = false,
-        scanned = 0, indexCount = 0, scanAt = 0, scanLimit = 25000, candidateLimit = 500,
-        category = "collect", radius = 1200, strategy = "adaptive",
-        travel = "teleport", verifySeconds = 2.5, attempts = 2,
-        filter = "", ignores = {}, selectedStat = "", goal = nil,
-        attempted = 0, confirmed = 0, failed = 0, current = nil,
-        lastPosition = nil, waypoint = nil, visitCooldown = setmetatable({}, {__mode = "k"}),
-        learning = {}, log = {}, startedAt = os.clock(), samples = {},
-        markerMode = false, markers = {}, overlay = nil, overlayVisible = false,
-        stopReason = "Not started", saved = false, saveQueued = false,
-    }
-    _G.IY_NOVA_PROGRESSION = PROG
-    local saveFile = "IY_NOVA_Progression.json"
-
-    local function say(title, body, seconds)
-        notify("PROGRESSION  /  " .. title, tostring(body), seconds or 9)
-    end
-    local function limitNumber(raw, default, low, high)
-        local value = tonumber(raw)
-        if not value or value ~= value or value == math.huge or value == -math.huge then value = default end
-        return math.clamp(value, low, high)
-    end
-    local function cleaned(raw, maxLength)
-        return string.lower(tostring(raw or "")):sub(1, maxLength or 60):match("^%s*(.-)%s*$") or ""
-    end
-    local function log(text)
-        local entry = os.date("%H:%M:%S") .. "  " .. tostring(text):sub(1, 150)
-        table.insert(PROG.log, 1, entry)
-        if #PROG.log > 60 then table.remove(PROG.log) end
-        if _G.IY_DEBUG then print("[NOVA progression]", entry) end
-    end
-    local function getBody()
-        local char = player.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local root = char and (char:FindFirstChild("HumanoidRootPart") or (hum and hum.RootPart))
-        if hum and root and hum.Health > 0 then return char, hum, root end
-        return nil
-    end
-    local function getRootPosition()
-        local _, _, root = getBody()
-        return root and root.Position or nil
-    end
-    local function available(instance)
-        return typeof(instance) == "Instance" and instance.Parent ~= nil and instance:IsDescendantOf(world)
-    end
-    local function matchesAny(str, terms)
-        for _, term in ipairs(terms) do
-            if string.find(str, term, 1, true) then return true end
-        end
-        return false
-    end
-    local forbiddenTerms = {"lava", "killbrick", "killpart", "hazard", "damagepart", "death", "void", "shop", "buy", "purchase", "robux", "gamepass", "donation", "devproduct", "price"}
-    local checkpoints = {"checkpoint", "stage", "savepoint", "finish", "endzone", "respawnpoint"}
-    local collectibles = {"orb", "coin", "gem", "pickup", "collect", "drop", "star", "token", "crystal", "chest", "diamond", "cash", "money", "treasure", "loot", "ring", "reward", "present", "egg"}
-    local resources = {"ore", "mineral", "tree", "log", "rock", "harvest", "resource", "farm", "crop", "fruit", "plant", "wheat", "mine", "wood"}
-    local interactables = {"button", "lever", "switch", "trigger", "unlock", "open", "claim", "interact"}
-    local function contextName(part)
-        local chunks = {string.lower(part.Name)}
-        local ancestor = part.Parent
-        local steps = 0
-        while ancestor and ancestor ~= world and steps < 3 do
-            if ancestor:IsA("Model") and Players:GetPlayerFromCharacter(ancestor) then return "" end
-            table.insert(chunks, string.lower(ancestor.Name))
-            ancestor = ancestor.Parent
-            steps = steps + 1
-        end
-        return table.concat(chunks, " ")
-    end
-    local function classify(part)
-        if not part:IsA("BasePart") or part.Size.Magnitude > 110 then return nil end
-        if player.Character and part:IsDescendantOf(player.Character) then return nil end
-        local s = contextName(part)
-        if s == "" or matchesAny(s, forbiddenTerms) then return nil end
-        if matchesAny(s, checkpoints) then return "checkpoint", s end
-        if matchesAny(s, collectibles) then return "collect", s end
-        if matchesAny(s, resources) then return "resource", s end
-        if matchesAny(s, interactables) then return "interact", s end
-        local hasPrompt = part:FindFirstChildOfClass("ProximityPrompt") ~= nil
-        local hasClick = part:FindFirstChildOfClass("ClickDetector") ~= nil
-        if (hasPrompt or hasClick) and not matchesAny(s, {"shop", "buy", "sell", "upgrade", "purchase", "price"}) then
-            return "interact", s
-        end
-        return nil
-    end
-    local function eligible(entry)
-        if not available(entry.part) then return false end
-        if PROG.category ~= "all" and PROG.category ~= entry.kind then return false end
-        if PROG.filter ~= "" and not string.find(entry.path, PROG.filter, 1, true) then return false end
-        for _, excluded in ipairs(PROG.ignores) do
-            if string.find(entry.path, excluded, 1, true) then return false end
-        end
-        if (PROG.visitCooldown[entry.part] or 0) > os.clock() then return false end
-        return true
-    end
-    local function addCandidate(part, targetTable)
-        if not available(part) or targetTable[part] then return false end
-        local kind, path = classify(part)
-        if not kind then return false end
-        targetTable[part] = {part = part, kind = kind, path = path, label = part.Name:sub(1, 50)}
-        return true
-    end
-    local function candidateCount()
-        local n = 0
-        for _, entry in pairs(PROG.candidates) do
-            if eligible(entry) then n = n + 1 end
-        end
-        return n
-    end
-    local function refreshMarkers()
-        for _, obj in pairs(PROG.markers) do pcall(function() obj:Destroy() end) end
-        table.clear(PROG.markers)
-        if not PROG.markerMode then return end
-        local rootPos = getRootPosition()
-        if not rootPos then return end
-        local choices = {}
-        for _, item in pairs(PROG.candidates) do
-            if eligible(item) then
-                local distance = (rootPos - item.part.Position).Magnitude
-                if distance <= PROG.radius then
-                    table.insert(choices, {entry = item, distance = distance})
-                end
-            end
-        end
-        table.sort(choices, function(a, b) return a.distance < b.distance end)
-        for i = 1, math.min(#choices, 38) do
-            local entry = choices[i].entry
-            local highlight = Instance.new("Highlight")
-            highlight.Name = "NOVA_ProgressObjective"
-            highlight.Adornee = entry.part
-            highlight.FillTransparency = 0.75
-            highlight.OutlineTransparency = 0.05
-            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            highlight.FillColor = entry.kind == "checkpoint" and Color3.fromRGB(96, 230, 180)
-                or entry.kind == "resource" and Color3.fromRGB(170, 160, 252)
-                or Color3.fromRGB(255, 209, 107)
-            highlight.Parent = entry.part
-            table.insert(PROG.markers, highlight)
-        end
-    end
-    local function scheduleSave()
-        if PROG.saveQueued or type(waxwritefile) ~= "function" then return end
-        PROG.saveQueued = true
-        task.delay(1.4, function()
-            PROG.saveQueued = false
-            local settings = {
-                category = PROG.category, radius = PROG.radius,
-                strategy = PROG.strategy, travel = PROG.travel,
-                filter = PROG.filter, ignores = PROG.ignores,
-                selectedStat = PROG.selectedStat, verifySeconds = PROG.verifySeconds,
-                attempts = PROG.attempts,
-            }
-            local ok, encoded = pcall(function() return http:JSONEncode(settings) end)
-            if ok then pcall(waxwritefile, saveFile, encoded) end
-        end)
-    end
-    if type(waxreadfile) == "function" then
-        local ok, contents = pcall(waxreadfile, saveFile)
-        if ok and type(contents) == "string" then
-            local decoded, settings = pcall(function() return http:JSONDecode(contents) end)
-            if decoded and type(settings) == "table" then
-                if table.find({"collect", "checkpoint", "resource", "interact", "all"}, settings.category) then PROG.category = settings.category end
-                if table.find({"adaptive", "nearest", "rarity"}, settings.strategy) then PROG.strategy = settings.strategy end
-                if table.find({"teleport", "walk"}, settings.travel) then PROG.travel = settings.travel end
-                PROG.radius = limitNumber(settings.radius, 1200, 30, 5000)
-                PROG.filter = cleaned(settings.filter)
-                PROG.selectedStat = cleaned(settings.selectedStat)
-                PROG.verifySeconds = limitNumber(settings.verifySeconds, 2.5, 0.6, 8)
-                PROG.attempts = math.floor(limitNumber(settings.attempts, 2, 1, 3))
-                if type(settings.ignores) == "table" then
-                    for _, value in ipairs(settings.ignores) do
-                        if type(value) == "string" and #PROG.ignores < 20 then
-                            table.insert(PROG.ignores, cleaned(value))
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    local function scanObjectives(callback)
-        PROG.scanGeneration = PROG.scanGeneration + 1
-        local generation = PROG.scanGeneration
-        PROG.scanActive = true
-        task.spawn(function()
-            local nextCandidates, count = {}, 0
-            local ok, descendants = pcall(function() return world:GetDescendants() end)
-            if not ok then
-                PROG.scanActive = false
-                log("Workspace scan failed: " .. tostring(descendants))
-                return
-            end
-            for i = 1, math.min(#descendants, PROG.scanLimit) do
-                if generation ~= PROG.scanGeneration then return end
-                local obj = descendants[i]
-                if obj:IsA("BasePart") and addCandidate(obj, nextCandidates) then
-                    count = count + 1
-                end
-                if i % 400 == 0 then task.wait() end
-                if count >= PROG.candidateLimit * 3 then break end
-            end
-            if generation ~= PROG.scanGeneration then return end
-            local nearest, selected = {}, {}
-            local root = getRootPosition()
-            for _, item in pairs(nextCandidates) do
-                local distance = root and (root - item.part.Position).Magnitude or 0
-                table.insert(nearest, {item = item, distance = distance})
-            end
-            table.sort(nearest, function(a, b) return a.distance < b.distance end)
-            for i = 1, math.min(#nearest, PROG.candidateLimit) do
-                local item = nearest[i].item
-                selected[item.part] = item
-            end
-            PROG.candidates = selected
-            PROG.indexCount = math.min(#nearest, PROG.candidateLimit)
-            PROG.scanned = #nearest
-            PROG.scanAt = os.clock()
-            PROG.scanActive = false
-            refreshMarkers()
-            log("Indexed " .. #nearest .. " candidate objects (" .. candidateCount() .. " matching filters)")
-            if callback then callback() end
-        end)
-    end
-
-    local function keyFromStat(stat)
-        return stat.Parent.Name .. "." .. stat.Name
-    end
-    local function collectStats()
-        local values, total = {}, 0
-        local sources = {player:FindFirstChild("leaderstats")}
-        for _, name in ipairs({"Stats", "Data", "NormalStats", "PlayerStats", "Currencies"}) do
-            local folder = player:FindFirstChild(name)
-            if folder then table.insert(sources, folder) end
-        end
-        for _, source in ipairs(sources) do
-            if source then
-                for _, obj in ipairs(source:GetChildren()) do
-                    if total >= 80 then break end
-                    if obj:IsA("IntValue") or obj:IsA("NumberValue") then
-                        values[keyFromStat(obj)] = obj.Value
-                        total = total + 1
-                    elseif obj:IsA("Folder") then
-                        for _, nested in ipairs(obj:GetChildren()) do
-                            if total >= 80 then break end
-                            if nested:IsA("IntValue") or nested:IsA("NumberValue") then
-                                values[source.Name .. "." .. obj.Name .. "." .. nested.Name] = nested.Value
-                                total = total + 1
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        return values
-    end
-    local function matchingStat(stats)
-        local requested = PROG.selectedStat
-        if requested == "" then return nil, nil end
-        for name, value in pairs(stats) do
-            if cleaned(name) == requested then return name, value end
-        end
-        for name, value in pairs(stats) do
-            if cleaned(name):match("[^%.]+$") == requested then return name, value end
-        end
-        return nil, nil
-    end
-    local function changedStats(before, after)
-        local selectedName = matchingStat(before)
-        local totalChange, selectedChange = 0, nil
-        for name, oldValue in pairs(before) do
-            local current = after[name]
-            if current and current ~= oldValue then
-                totalChange = totalChange + 1
-                if name == selectedName then selectedChange = current - oldValue end
-            end
-        end
-        if PROG.selectedStat ~= "" then
-            return selectedChange ~= nil, selectedChange or 0, selectedName or PROG.selectedStat
-        end
-        return totalChange > 0, totalChange, "any stat"
-    end
-    local function sampleTracked()
-        local _, value = matchingStat(collectStats())
-        if value == nil then return nil end
-        table.insert(PROG.samples, {when = os.clock(), value = value})
-        while #PROG.samples > 90 do table.remove(PROG.samples, 1) end
-        return value
-    end
-    local function ratePerMinute()
-        if #PROG.samples < 2 then return 0 end
-        local oldest, newest = PROG.samples[1], PROG.samples[#PROG.samples]
-        local seconds = newest.when - oldest.when
-        if seconds < 2 then return 0 end
-        return (newest.value - oldest.value) * 60 / seconds
-    end
-    local function goalReached()
-        if PROG.goal == nil or PROG.selectedStat == "" then return false end
-        local _, value = matchingStat(collectStats())
-        return value ~= nil and value >= PROG.goal
-    end
-    local function chooseTarget(origin, excluded)
-        local best, bestScore = nil, -math.huge
-        for _, item in pairs(PROG.candidates) do
-            if not (excluded and (excluded == item.part or (type(excluded) == "table" and excluded[item.part]))) and eligible(item) then
-                local distance = (item.part.Position - origin).Magnitude
-                if distance <= PROG.radius then
-                    local score = -(distance / 30)
-                    if PROG.strategy == "adaptive" then
-                        local learned = PROG.learning[item.kind]
-                        if learned and learned.count > 0 then
-                            score = score + math.clamp(learned.sum / learned.count, 0, 60) * 5
-                        end
-                    elseif PROG.strategy == "rarity" then
-                        score = score + (item.kind == "checkpoint" and 25 or 0)
-                        score = score + (item.kind == "collect" and 10 or 0)
-                        if matchesAny(item.path, {"legendary", "rare", "mythic", "epic", "rainbow", "gold"}) then score = score + 45 end
-                    end
-                    if score > bestScore then best, bestScore = item, score end
-                end
-            end
-        end
-        return best
-    end
-    local function targetName(entry)
-        return (entry and (entry.label .. " [" .. entry.kind .. "]") or "None")
-    end
-    local function travelTo(entry, token)
-        local char, hum, root = getBody()
-        if not root then return false, "Character unavailable" end
-        local part = entry.part
-        if not available(part) then return false, "Object despawned" end
-        local position = part.Position
-        if PROG.travel == "teleport" then
-            PROG.lastPosition = char:GetPivot()
-            local offset = Vector3.new(0, math.clamp(part.Size.Y / 2 + 1.7, 1.3, 5), 0)
-            local ok = pcall(function() char:PivotTo(CFrame.new(position + offset)) end)
-            task.wait(0.16)
-            if token ~= PROG.token then return false, "Cancelled" end
-            if not ok or (root.Position - position).Magnitude > math.max(15, part.Size.Magnitude) then
-                return false, "Position was rejected or corrected"
-            end
-        else
-            local destination = position + Vector3.new(0, math.min(part.Size.Y * 0.5, 3), 0)
-            -- Standard Humanoid movement; avoid blocking for long distances.
-            local ok = pcall(function() hum:MoveTo(destination) end)
-            if not ok then return false, "MoveTo failed" end
-            local start = os.clock()
-            while token == PROG.token and os.clock() - start < 8 do
-                if (root.Position - destination).Magnitude <= 7 then break end
-                task.wait(0.14)
-            end
-            if token ~= PROG.token then return false, "Cancelled" end
-            if (root.Position - destination).Magnitude > 9 then return false, "Walk target timed out" end
-        end
-        return true
-    end
-    local function tryInteraction(entry, token)
-        local part = entry.part
-        if not available(part) or matchesAny(entry.path, forbiddenTerms) then return end
-        local prompt = part:FindFirstChildOfClass("ProximityPrompt")
-            or (part.Parent and part.Parent:FindFirstChildOfClass("ProximityPrompt"))
-        if prompt and prompt.Enabled and not matchesAny(cleaned(prompt.ActionText .. " " .. prompt.ObjectText),
-            {"buy", "purchase", "donate", "robux", "shop", "gamepass", "price"}) then
-            local _, _, root = getBody()
-            local promptParent = prompt.Parent
-            local promptPos = promptParent and (promptParent:IsA("BasePart") and promptParent.Position
-                or promptParent:IsA("Attachment") and promptParent.WorldPosition)
-            if root and promptPos and (root.Position - promptPos).Magnitude <= prompt.MaxActivationDistance + 3 then
-                pcall(function() prompt:InputHoldBegin() end)
-                task.wait(math.clamp(prompt.HoldDuration + 0.12, 0.12, 4))
-                if token ~= PROG.token then pcall(function() prompt:InputHoldEnd() end) return end
-                pcall(function() prompt:InputHoldEnd() end)
-            end
-        end
-        local click = part:FindFirstChildOfClass("ClickDetector")
-            or (part.Parent and part.Parent:FindFirstChildOfClass("ClickDetector"))
-        if click and type(fireclickdetector) == "function" then
-            pcall(fireclickdetector, click)
-        end
-    end
-    local function verifyInteraction(entry, before, token)
-        local start = os.clock()
-        while token == PROG.token and os.clock() - start < PROG.verifySeconds do
-            if not available(entry.part) then return true, "despawn", 1 end
-            local after = collectStats()
-            local changed, delta, statName = changedStats(before, after)
-            if changed then return true, "changed " .. tostring(statName), delta end
-            task.wait(0.15)
-        end
-        return false, "no observed reward or despawn", 0
-    end
-    local function attempt(entry, token)
-        local before = collectStats()
-        local started = os.clock()
-        for try = 1, PROG.attempts do
-            if token ~= PROG.token then return nil, "cancelled" end
-            if not available(entry.part) then return true, "despawn", 1 end
-            local moved, reason = travelTo(entry, token)
-            if not moved then
-                if reason == "Cancelled" then return nil, reason end
-                return false, reason
-            end
-            tryInteraction(entry, token)
-            local verified, method, delta = verifyInteraction(entry, before, token)
-            if verified then
-                local elapsed = math.max(0.1, os.clock() - started)
-                local learned = PROG.learning[entry.kind] or {sum = 0, count = 0}
-                local rewardRate = math.log(1 + math.max(0, delta)) / elapsed
-                learned.sum = learned.sum + math.clamp(rewardRate, 0, 80)
-                learned.count = learned.count + 1
-                PROG.learning[entry.kind] = learned
-                return true, method
-            end
-            task.wait(0.22)
-        end
-        return false, "no confirmed collection"
-    end
-    local function stop(reason)
-        PROG.token = PROG.token + 1
-        PROG.running = false
-        PROG.paused = false
-        PROG.current = nil
-        PROG.stopReason = reason or "Stopped"
-        log(PROG.stopReason)
-    end
-    local function start(farm)
-        if PROG.running then
-            PROG.farm = farm
-            PROG.paused = false
-            return "Autopilot already running; farm mode " .. (farm and "enabled" or "disabled")
-        end
-        PROG.running = true
-        PROG.paused = false
-        PROG.farm = farm
-        PROG.token = PROG.token + 1
-        PROG.startedAt = os.clock()
-        local token = PROG.token
-        log("Autopilot started (" .. (farm and "repeating" or "one-pass") .. ", " .. PROG.travel .. ")")
-        scanObjectives()
-        task.spawn(function()
-            while PROG.scanActive and token == PROG.token do task.wait(0.15) end
-            local emptySince = os.clock()
-            while token == PROG.token and PROG.running do
-                if PROG.paused then
-                    task.wait(0.25)
-                elseif not getRootPosition() then
-                    task.wait(0.75)
-                elseif goalReached() then
-                    stop("Goal reached")
-                    say("Goal reached", "Stopped because the tracked statistic reached your goal.")
-                    break
-                else
-                    local pos = getRootPosition()
-                    local entry = pos and chooseTarget(pos)
-                    if entry then
-                        emptySince = os.clock()
-                        PROG.current = entry
-                        PROG.attempted = PROG.attempted + 1
-                        local confirmed, method = attempt(entry, token)
-                        if token ~= PROG.token then break end
-                        if confirmed then
-                            PROG.confirmed = PROG.confirmed + 1
-                            PROG.visitCooldown[entry.part] = os.clock() + 12
-                            log("CONFIRMED " .. targetName(entry) .. " via " .. tostring(method))
-                        elseif confirmed == false then
-                            PROG.failed = PROG.failed + 1
-                            PROG.visitCooldown[entry.part] = os.clock() + 35
-                            log("SKIPPED " .. targetName(entry) .. ": " .. tostring(method))
-                        end
-                        PROG.current = nil
-                        task.wait(0.1)
-                    else
-                        PROG.current = nil
-                        if os.clock() - PROG.scanAt >= (farm and 9 or 20) and not PROG.scanActive then
-                            scanObjectives()
-                        end
-                        if not farm and os.clock() - emptySince > 2.5 and not PROG.scanActive then
-                            stop("One-pass finished: no eligible objectives in range")
-                            say("Route complete", "Confirmed " .. PROG.confirmed .. " objects; " .. PROG.failed .. " unverified attempts.")
-                            break
-                        end
-                        task.wait(0.6)
-                    end
-                end
-            end
-        end)
-        return "Autopilot enabled. Progress is counted only after a stat change or target despawn."
-    end
-    local function register(name, aliases, usage, description, callback)
-        if findCmd(name) then
-            log("Command name already exists: " .. name)
-            return false
-        end
-        local accepted = {}
-        for _, alias in ipairs(aliases or {}) do
-            if not findCmd(alias) then table.insert(accepted, alias) end
-        end
-        addcmd(name, accepted, callback)
-        addcmdtext(usage, "NOVA PROGRESSION", description)
-        return true
-    end
-    local function getClosest(limit)
-        local root = getRootPosition()
-        if not root then return {} end
-        local all = {}
-        for _, item in pairs(PROG.candidates) do
-            if eligible(item) then
-                local distance = (root - item.part.Position).Magnitude
-                if distance <= PROG.radius then
-                    table.insert(all, {entry = item, distance = distance})
-                end
-            end
-        end
-        table.sort(all, function(a, b) return a.distance < b.distance end)
-        while #all > limit do table.remove(all) end
-        return all
-    end
-    local function getStatus()
-        local elapsed = math.max(1, os.clock() - PROG.startedAt)
-        local _, tracked = matchingStat(collectStats())
-        return string.format(
-            "Mode: %s (%s)%s\nTargets: %d   |   Verified: %d   |   Unverified: %d\nRate: %.1f verified/min  |  Radius: %d\nStat: %s%s\nCurrent: %s",
-            PROG.running and (PROG.paused and "PAUSED" or "RUNNING") or "STOPPED",
-            PROG.category, PROG.farm and " / FARM" or "",
-            candidateCount(), PROG.confirmed, PROG.failed,
-            PROG.confirmed * 60 / elapsed, PROG.radius,
-            PROG.selectedStat ~= "" and PROG.selectedStat or "auto (any observable stat)",
-            tracked and (" = " .. string.format("%.3g", tracked)) or "",
-            targetName(PROG.current)
-        )
-    end
-
-    -- Dashboard: no per-frame loops or input capture while hidden.
-    local function makeDashboard()
-        if PROG.overlay then return PROG.overlay end
-        local panel = Instance.new("Frame")
-        panel.Name = "NOVA_ProgressionHub"
-        panel.BackgroundColor3 = Color3.fromRGB(22, 27, 40)
-        panel.BorderSizePixel = 0
-        panel.Position = UDim2.new(0, 15, 0.34, 0)
-        panel.Size = UDim2.fromOffset(302, 232)
-        panel.ZIndex = 90
-        panel.Active = true
-        panel.Parent = PARENT
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 10)
-        corner.Parent = panel
-        local header = Instance.new("TextLabel")
-        header.BackgroundTransparency = 1
-        header.Position = UDim2.fromOffset(12, 5)
-        header.Size = UDim2.new(1, -50, 0, 27)
-        header.Text = "NOVA  /  PROGRESSION LAB"
-        header.Font = Enum.Font.GothamBold
-        header.TextSize = 14
-        header.TextColor3 = Color3.fromRGB(128, 189, 255)
-        header.TextXAlignment = Enum.TextXAlignment.Left
-        header.ZIndex = 92
-        header.Parent = panel
-        local close = Instance.new("TextButton")
-        close.Text = "×"
-        close.TextSize = 22
-        close.Font = Enum.Font.Gotham
-        close.TextColor3 = Color3.new(1, 1, 1)
-        close.BackgroundTransparency = 1
-        close.Size = UDim2.fromOffset(30, 28)
-        close.Position = UDim2.new(1, -34, 0, 3)
-        close.ZIndex = 93
-        close.Parent = panel
-        close.MouseButton1Click:Connect(function() PROG.overlayVisible = false panel.Visible = false end)
-        local detail = Instance.new("TextLabel")
-        detail.Name = "Readout"
-        detail.BackgroundColor3 = Color3.fromRGB(32, 39, 57)
-        detail.BorderSizePixel = 0
-        detail.Position = UDim2.fromOffset(10, 38)
-        detail.Size = UDim2.new(1, -20, 0, 133)
-        detail.Font = Enum.Font.Code
-        detail.TextColor3 = Color3.fromRGB(224, 238, 250)
-        detail.TextSize = 12
-        detail.TextXAlignment = Enum.TextXAlignment.Left
-        detail.TextYAlignment = Enum.TextYAlignment.Top
-        detail.TextWrapped = true
-        detail.Text = "Loading progression status..."
-        detail.ZIndex = 92
-        detail.Parent = panel
-        local pad = Instance.new("UIPadding")
-        pad.PaddingLeft = UDim.new(0, 8)
-        pad.PaddingTop = UDim.new(0, 7)
-        pad.Parent = detail
-        local function addButton(textValue, x, width, callback)
-            local button = Instance.new("TextButton")
-            button.Text = textValue
-            button.Font = Enum.Font.GothamMedium
-            button.TextSize = 12
-            button.TextColor3 = Color3.new(1, 1, 1)
-            button.BackgroundColor3 = Color3.fromRGB(52, 69, 99)
-            button.BorderSizePixel = 0
-            button.Position = UDim2.fromOffset(x, 182)
-            button.Size = UDim2.fromOffset(width, 36)
-            button.ZIndex = 92
-            button.Parent = panel
-            local c = Instance.new("UICorner")
-            c.CornerRadius = UDim.new(0, 6)
-            c.Parent = button
-            button.MouseButton1Click:Connect(callback)
-        end
-        addButton("SCAN", 10, 62, function() scanObjectives() end)
-        addButton("START", 79, 62, function() say("Autopilot", start(false)) end)
-        addButton("FARM", 148, 62, function() say("Farm", start(true)) end)
-        addButton("STOP", 217, 74, function() stop("Stopped from dashboard") end)
-        PROG.overlay = panel
-        task.spawn(function()
-            while panel.Parent do
-                if PROG.overlayVisible then detail.Text = getStatus() end
-                task.wait(0.6)
-            end
-        end)
-        return panel
-    end
-
-    register("proghub", {"progresshub"}, "proghub", "Open/close a compact live progression dashboard with scan, start, farm, stop.", function()
-        local panel = makeDashboard()
-        PROG.overlayVisible = not PROG.overlayVisible
-        panel.Visible = PROG.overlayVisible
-        return "Progression dashboard " .. (PROG.overlayVisible and "opened" or "hidden")
-    end)
-    register("progscan", {"objectivescan"}, "progscan", "Asynchronously discover relevant orbs, coins, resources, checkpoints and interactables.", function()
-        scanObjectives(function() say("Scan complete", string.format("Found %d possible targets; %d fit your filters.", PROG.scanned, candidateCount())) end)
-        return "Scanning the world for observable objectives..."
-    end)
-    register("proglist", {"objectivefinder"}, "proglist", "Show nearest matching objectives and their approximate distances.", function()
-        local items = getClosest(10)
-        local lines = {}
-        for i, item in ipairs(items) do table.insert(lines, string.format("%d. %s [%s]  %d studs", i, item.entry.label, item.entry.kind, item.distance)) end
-        say("Nearby objectives", #lines > 0 and table.concat(lines, "\n") or "None indexed. Try progscan or change progtypes.", 16)
-    end)
-    register("progtypes", {"objectivetype"}, "progtypes [collect|resource|checkpoint|interact|all]", "Choose which objective category the route engine is permitted to visit.", function(a)
-        local requested = cleaned(a[1])
-        if not table.find({"collect", "resource", "checkpoint", "interact", "all"}, requested) then return "Choose collect, resource, checkpoint, interact or all." end
-        PROG.category = requested; scheduleSave(); refreshMarkers()
-        return "Objective type: " .. requested
-    end)
-    register("progfilter", {}, "progfilter [name|clear]", "Include only objectives whose name/path contains the phrase (use clear to reset).", function(a)
-        PROG.filter = cleaned(a[1])
-        if PROG.filter == "clear" then PROG.filter = "" end
-        scheduleSave(); refreshMarkers()
-        return "Name filter: " .. (PROG.filter ~= "" and PROG.filter or "any")
-    end)
-    register("progignore", {}, "progignore [word]", "Ignore matching objects, e.g. progignore lava or progignore x20.", function(a)
-        local phrase = cleaned(a[1])
-        if phrase == "" then return "Usage: progignore [word]" end
-        if #PROG.ignores >= 20 then return "The ignore list is full (20 patterns)." end
-        if not table.find(PROG.ignores, phrase) then table.insert(PROG.ignores, phrase) end
-        scheduleSave(); refreshMarkers()
-        return "Ignoring objective names that contain: " .. phrase
-    end)
-    register("progunignore", {}, "progunignore [word]", "Remove an ignored objective keyword.", function(a)
-        local phrase = cleaned(a[1])
-        for i = #PROG.ignores, 1, -1 do if PROG.ignores[i] == phrase then table.remove(PROG.ignores, i) end end
-        scheduleSave(); refreshMarkers()
-        return "Removed ignored keyword: " .. phrase
-    end)
-    register("progclearignore", {}, "progclearignore", "Clear all ignored object name patterns.", function()
-        table.clear(PROG.ignores); scheduleSave(); refreshMarkers(); return "Ignore list cleared."
-    end)
-    register("progradius", {}, "progradius [studs]", "Set objective scanning/route distance from 30 to 5000 studs.", function(a)
-        PROG.radius = limitNumber(a[1], PROG.radius, 30, 5000)
-        scheduleSave(); refreshMarkers()
-        return "Route radius: " .. PROG.radius .. " studs."
-    end)
-    register("progstrategy", {}, "progstrategy [nearest|adaptive|rarity]", "Nearest route, learned reward-per-time routing, or rare-name priority.", function(a)
-        local value = cleaned(a[1])
-        if not table.find({"nearest", "adaptive", "rarity"}, value) then return "Choose nearest, adaptive or rarity." end
-        PROG.strategy = value; scheduleSave()
-        return "Routing strategy: " .. value
-    end)
-    register("progtravel", {}, "progtravel [teleport|walk]", "Choose how the progression autopilot approaches objectives.", function(a)
-        local value = cleaned(a[1])
-        if value ~= "teleport" and value ~= "walk" then return "Choose teleport or walk." end
-        PROG.travel = value; scheduleSave()
-        return "Approach mode: " .. value
-    end)
-    register("progroute", {}, "progroute", "Preview an optimized nearest-neighbor path without moving your character.", function()
-        local position = getRootPosition()
-        if not position then return "Character not available." end
-        local visited, routes, distance = {}, {}, 0
-        for i = 1, 10 do
-            -- Pure preview: use a local visited set, do not change the live route state.
-            local entry = chooseTarget(position, visited)
-            if not entry then break end
-            visited[entry.part] = true
-            local leg = (entry.part.Position - position).Magnitude
-            distance = distance + leg
-            table.insert(routes, string.format("%d. %s  (+%d studs)", i, entry.label, leg))
-            position = entry.part.Position
-        end
-        say("Route preview", #routes > 0 and (table.concat(routes, "\n") .. "\nTotal: " .. math.floor(distance) .. " studs (straight line)") or "No eligible targets.", 17)
-    end)
-    register("proggoto", {"objectivegoto"}, "proggoto [index]", "Move to an indexed objective from proglist without enabling a loop.", function(a)
-        local index = math.floor(limitNumber(a[1], 1, 1, 10))
-        local items = getClosest(10)
-        local entry = items[index] and items[index].entry
-        if not entry then return "Objective not found. Run progscan and proglist first." end
-        local moved, reason = travelTo(entry, PROG.token)
-        return moved and ("Approached: " .. targetName(entry)) or ("Unable to approach: " .. tostring(reason))
-    end)
-    register("progstart", {"objectiverun"}, "progstart", "One-pass objective autopilot, with confirmed collection and failure quarantine.", function()
-        return start(false)
-    end)
-    register("progfarm", {"objectfarm"}, "progfarm", "Repeat objective discovery and routing as collectibles respawn.", function()
-        return start(true)
-    end)
-    register("progpause", {}, "progpause", "Pause progression after the current interaction.", function()
-        PROG.paused = true; return "Autopilot paused."
-    end)
-    register("progresume", {}, "progresume", "Resume the paused objective autopilot.", function()
-        if not PROG.running then return "No active run. Use progstart or progfarm." end
-        PROG.paused = false; return "Autopilot resumed."
-    end)
-    register("progstop", {"unprogfarm"}, "progstop", "Cancel pending movement/interactions and stop the progression loop.", function()
-        stop("Stopped by command")
-        return "Progression autopilot stopped."
-    end)
-    register("progstatus", {}, "progstatus", "Show live route status, success confirmation and observed progress.", function()
-        return getStatus()
-    end)
-    register("progstat", {}, "progstat [name|clear]", "Track a specific numeric player stat; set before starting for reliable reward confirmation.", function(a)
-        local name = cleaned(a[1])
-        if name == "clear" then
-            PROG.selectedStat = ""; PROG.goal = nil; table.clear(PROG.samples); scheduleSave()
-            return "Tracking any observable numeric player stat."
-        end
-        if name == "" then
-            local names = {}
-            for k in pairs(collectStats()) do table.insert(names, k) end
-            table.sort(names)
-            say("Observable numeric stats", #names > 0 and table.concat(names, "\n") or "No recognized numeric stats available.", 16)
-            return nil
-        end
-        PROG.selectedStat = name
-        local actual, value = matchingStat(collectStats())
-        table.clear(PROG.samples)
-        scheduleSave()
-        return actual and ("Tracking " .. actual .. " = " .. tostring(value)) or ("Stat '" .. name .. "' isn't currently observable. Use progstat to list possible names.")
-    end)
-    register("proggoal", {}, "proggoal [number|clear]", "Automatically stop progression when the tracked statistic reaches an amount.", function(a)
-        if cleaned(a[1]) == "clear" then PROG.goal = nil return "Goal disabled." end
-        if PROG.selectedStat == "" then return "Choose a stat first: progstat Cash" end
-        local amount = tonumber(a[1])
-        if not amount or amount ~= amount or math.abs(amount) == math.huge then return "Usage: proggoal [numeric target]" end
-        PROG.goal = amount
-        return "Run will stop if " .. PROG.selectedStat .. " reaches " .. tostring(amount)
-    end)
-    register("progforecast", {}, "progforecast", "Estimate time to stat goal using actually observed gains per minute.", function()
-        if PROG.selectedStat == "" then return "Select a statistic using progstat [name] first." end
-        local _, value = matchingStat(collectStats())
-        if value == nil then return "The selected stat isn't observable." end
-        local rate = ratePerMinute()
-        if not PROG.goal then return string.format("%s = %.4g | observed: %.2f/min. Set proggoal [number] for ETA.", PROG.selectedStat, value, rate) end
-        if value >= PROG.goal then return "Goal is already reached." end
-        if rate <= 0 then return "No positive measured progress yet; can't estimate ETA." end
-        return string.format("Current: %.4g | Goal: %.4g | Gain: %.2f/min | ETA: %.1f minutes", value, PROG.goal, rate, (PROG.goal - value) / rate)
-    end)
-    register("progverify", {}, "progverify [seconds] [attempts]", "Adjust confirmation timeout and retry budget to handle delayed game rewards.", function(a)
-        PROG.verifySeconds = limitNumber(a[1], PROG.verifySeconds, 0.6, 8)
-        PROG.attempts = math.floor(limitNumber(a[2], PROG.attempts, 1, 3))
-        scheduleSave()
-        return string.format("Verification window %.1fs, maximum %d attempts per target.", PROG.verifySeconds, PROG.attempts)
-    end)
-    register("progmarkers", {"objectiveesp"}, "progmarkers", "Highlight up to 38 nearby possible objectives.", function()
-        PROG.markerMode = true; refreshMarkers(); return "Objective markers enabled."
-    end)
-    register("unprogmarkers", {"unobjectiveesp"}, "unprogmarkers", "Remove all progression objective highlights.", function()
-        PROG.markerMode = false; refreshMarkers(); return "Objective markers disabled."
-    end)
-    register("progcheckpoint", {}, "progcheckpoint", "Save your current position as a local return point.", function()
-        local char = getBody()
-        if not char then return "Character unavailable." end
-        PROG.waypoint = char:GetPivot()
-        return "Saved a local return waypoint."
-    end)
-    register("progback", {}, "progback", "Return to your saved waypoint or previous pre-teleport location.", function()
-        local char = getBody()
-        if not char then return "Character unavailable." end
-        local restore = PROG.waypoint or PROG.lastPosition
-        if not restore then return "No return position saved. Use progcheckpoint first." end
-        local current = char:GetPivot()
-        local ok = pcall(function() char:PivotTo(restore) end)
-        if ok then PROG.lastPosition = current end
-        return ok and "Returned to saved position (subject to game rules)." or "Return failed."
-    end)
-    register("proglog", {}, "proglog", "View the latest verification successes, failures and route decisions.", function()
-        local lines = {}
-        for i = 1, math.min(10, #PROG.log) do table.insert(lines, PROG.log[i]) end
-        say("Activity log", #lines > 0 and table.concat(lines, "\n") or "No activity yet.", 16)
-    end)
-    register("progcopylog", {}, "progcopylog", "Copy progression diagnostics and activity logs to your clipboard if supported.", function()
-        if type(everyClipboard) ~= "function" then return "Clipboard API is unavailable." end
-        local report = "NOVA Progression Diagnostics\n" .. getStatus() .. "\n" .. table.concat(PROG.log, "\n")
-        local ok = pcall(everyClipboard, report)
-        return ok and "Progression diagnostics copied." or "Copy failed."
-    end)
-    register("proglearn", {}, "proglearn", "View the observed reward-rate model used by adaptive routing.", function()
-        local lines = {}
-        for kind, data in pairs(PROG.learning) do
-            table.insert(lines, string.format("%s: %d confirmed, score %.2f", kind, data.count, data.sum / math.max(1, data.count)))
-        end
-        say("Adaptive model", #lines > 0 and table.concat(lines, "\n") or "No confirmations yet. Successful routes teach the model.")
-    end)
-    register("progreset", {}, "progreset", "Reset session counters, reward learning, and temporary failed-target quarantines.", function()
-        stop("Session stats reset")
-        PROG.attempted, PROG.confirmed, PROG.failed = 0, 0, 0
-        PROG.visitCooldown = setmetatable({}, {__mode = "k"})
-        PROG.learning = {}
-        PROG.log = {}
-        PROG.startedAt = os.clock()
-        table.clear(PROG.samples)
-        refreshMarkers()
-        return "Progression session data reset. Saved preferences kept."
-    end)
-    register("progconfig", {}, "progconfig", "Display progression filters, route settings and verification configuration.", function()
-        return "Type: " .. PROG.category .. " | Filter: " .. (PROG.filter ~= "" and PROG.filter or "any")
-            .. " | Strategy: " .. PROG.strategy .. " | Travel: " .. PROG.travel
-            .. " | Radius: " .. PROG.radius .. " | Ignore terms: " .. #PROG.ignores
-            .. " | Verify: " .. PROG.verifySeconds .. "s × " .. PROG.attempts
-    end)
-    register("proghelp", {"progressionhelp"}, "proghelp", "Show progression engine setup and key commands.", function()
-        say("Getting started", "1. progscan  →  proglist  →  progmarkers\n"
-            .. "2. progtypes collect  →  progfilter orb\n"
-            .. "3. progstat Cash  →  proggoal 10000\n"
-            .. "4. progstrategy adaptive  →  progfarm\n"
-            .. "5. progstatus / proghub / progstop\n"
-            .. "Advanced: progverify, progtravel, progignore, progforecast, proglog", 18)
-    end)
-
-
-    -- Resource-agnostic tool scoring. Values come only from visible tool attributes.
-    local toolAssist = {enabled = false, metric = "auto", connection = nil, lastEquip = 0}
-    local metrics = {power = true, damage = true, multiplier = true, strength = true, level = true, speed = true, rarity = true}
-    local function toolScore(tool)
-        if not tool or not tool:IsA("Tool") then return -math.huge, "invalid" end
-        local best, bestSource = 0, "name fallback"
-        local attributes = tool:GetAttributes()
-        local weights = {power = 1, damage = 1, multiplier = 1, strength = 1, level = 0.1, speed = 0.5, rarity = 0.2}
-        for key, value in pairs(attributes) do
-            local lower = cleaned(key)
-            local weight = weights[lower]
-            if type(value) == "number" and value == value and value >= 0 and weight then
-                local score = value * weight
-                if toolAssist.metric == lower then score = score * 100 end
-                if toolAssist.metric == "auto" or toolAssist.metric == lower then
-                    if score > best then best, bestSource = score, "attribute " .. key end
-                end
-            end
-        end
-        for _, stat in ipairs(tool:GetChildren()) do
-            local lower = cleaned(stat.Name)
-            local weight = weights[lower]
-            if (stat:IsA("NumberValue") or stat:IsA("IntValue")) and weight then
-                local value = stat.Value
-                if value == value and value >= 0 and (toolAssist.metric == "auto" or lower == toolAssist.metric) then
-                    local score = value * weight * (toolAssist.metric == lower and 100 or 1)
-                    if score > best then best, bestSource = score, "value " .. stat.Name end
-                end
-            end
-        end
-        if best == 0 and toolAssist.metric == "auto" then
-            local lower = cleaned(tool.Name)
-            for rank, term in ipairs({"common", "uncommon", "rare", "epic", "legendary", "mythic", "divine"}) do
-                if string.find(lower, term, 1, true) then best = rank bestSource = "rarity word" end
-            end
-        end
-        return best, bestSource
-    end
-    local function rankedTools()
-        local char = player.Character
-        local backpack = player:FindFirstChildOfClass("Backpack")
-        local found = {}
-        for _, folder in ipairs({backpack, char}) do
-            if folder then
-                for _, tool in ipairs(folder:GetChildren()) do
-                    if tool:IsA("Tool") then
-                        local score, reason = toolScore(tool)
-                        table.insert(found, {tool = tool, score = score, source = reason})
-                    end
-                end
-            end
-        end
-        table.sort(found, function(a, b)
-            if a.score == b.score then return a.tool.Name < b.tool.Name end
-            return a.score > b.score
-        end)
-        return found
-    end
-    local function equipBest()
-        local _, hum = getBody()
-        if not hum then return "Character unavailable." end
-        local ranked = rankedTools()
-        local top = ranked[1]
-        if not top then return "No tools in your inventory." end
-        if top.score <= 0 then return "No meaningful tool stats detected. Use progtoolrank to inspect inventory." end
-        if top.tool.Parent == player.Character then return "Already equipped: " .. top.tool.Name end
-        local ok = pcall(function() hum:EquipTool(top.tool) end)
-        return ok and ("Equipped: " .. top.tool.Name .. " (visible score " .. string.format("%.2f", top.score) .. ")")
-            or "Couldn't equip tool; game may restrict equipping."
-    end
-    local function scheduleEquip()
-        local now = os.clock()
-        if now - toolAssist.lastEquip < 1.2 then return end
-        toolAssist.lastEquip = now
-        task.delay(0.2, function()
-            if toolAssist.enabled then equipBest() end
-        end)
-    end
-    register("progtoolrank", {}, "progtoolrank", "Rank inventory tools by observable power/damage/multiplier attributes or numeric values.", function()
-        local list = rankedTools()
-        local output = {}
-        for i = 1, math.min(#list, 10) do
-            local item = list[i]
-            table.insert(output, string.format("%d. %s | %.2f (%s)", i, item.tool.Name, item.score, item.source))
-        end
-        say("Tool ratings", #output > 0 and table.concat(output, "\n") or "No inventory tools detected.", 16)
-    end)
-    register("progbesttool", {}, "progbesttool", "Equip the highest-rated owned tool using visible numeric stats.", function()
-        return equipBest()
-    end)
-    register("progtoolmetric", {}, "progtoolmetric [auto|power|damage|multiplier|strength|level|speed|rarity]", "Choose which observable tool property matters most for auto-equipping.", function(a)
-        local metric = cleaned(a[1])
-        if metric ~= "auto" and not metrics[metric] then return "Choose auto, power, damage, multiplier, strength, level, speed or rarity." end
-        toolAssist.metric = metric
-        return "Tool scorer now prioritizes " .. metric
-    end)
-    register("progautotool", {}, "progautotool", "Automatically equip the strongest recognized tool when your backpack changes.", function()
-        toolAssist.enabled = true
-        if toolAssist.connection then toolAssist.connection:Disconnect() toolAssist.connection = nil end
-        local backpack = player:FindFirstChildOfClass("Backpack")
-        if backpack then toolAssist.connection = backpack.ChildAdded:Connect(scheduleEquip) end
-        return "Auto-best-tool enabled. " .. equipBest()
-    end)
-    register("unprogautotool", {}, "unprogautotool", "Disable automatic owned-tool upgrades and disconnect the backpack listener.", function()
-        toolAssist.enabled = false
-        if toolAssist.connection then toolAssist.connection:Disconnect() toolAssist.connection = nil end
-        return "Auto-best-tool disabled."
-    end)
-
-    -- Nearby reward/claim prompts only. We deliberately exclude shops and purchases.
-    local claim = {enabled = false, generation = 0, cooldown = setmetatable({}, {__mode = "k"}), tries = 0}
-    local function claimNearby()
-        local _, _, root = getBody()
-        if not root then return 0 end
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = {player.Character}
-        params.MaxParts = 140
-        local ok, nearby = pcall(function() return world:GetPartBoundsInRadius(root.Position, 18, params) end)
-        if not ok then return 0 end
-        local eligiblePrompts = {}
-        for _, part in ipairs(nearby) do
-            local title = cleaned(part.Name .. " " .. (part.Parent and part.Parent.Name or ""))
-            if matchesAny(title, {"claim", "bonus", "daily", "free", "gift", "reward"}) and
-                not matchesAny(title, {"buy", "shop", "robux", "purchase", "product", "donation", "gamepass"}) then
-                for _, prompt in ipairs(part:GetDescendants()) do
-                    if prompt:IsA("ProximityPrompt") and prompt.Enabled then
-                        local promptTitle = cleaned(prompt.Name .. " " .. prompt.ActionText .. " " .. prompt.ObjectText)
-                        if not matchesAny(promptTitle, {"buy", "shop", "robux", "purchase", "product", "donation", "gamepass"}) and
-                            (claim.cooldown[prompt] or 0) < os.clock() then
-                            table.insert(eligiblePrompts, prompt)
-                        end
-                    end
-                end
-            end
-            if #eligiblePrompts >= 6 then break end
-        end
-        local count = 0
-        for _, prompt in ipairs(eligiblePrompts) do
-            if prompt.Parent and prompt.Enabled then
-                local anchor = prompt.Parent
-                local pos = anchor:IsA("BasePart") and anchor.Position or anchor:IsA("Attachment") and anchor.WorldPosition
-                if pos and (root.Position - pos).Magnitude <= prompt.MaxActivationDistance + 2 then
-                    claim.cooldown[prompt] = os.clock() + 18
-                    pcall(function() prompt:InputHoldBegin() end)
-                    task.wait(math.clamp(prompt.HoldDuration + 0.1, 0.1, 3.5))
-                    pcall(function() prompt:InputHoldEnd() end)
-                    count = count + 1
-                    claim.tries = claim.tries + 1
-                end
-            end
-        end
-        return count
-    end
-    register("progclaim", {}, "progclaim", "Attempt eligible nearby free-reward prompts; no purchases or reward guarantees.", function()
-        local count = claimNearby()
-        return count .. " nearby eligible reward prompt(s) attempted (not guaranteed)."
-    end)
-    register("progautoclaim", {}, "progautoclaim", "Repeat nearby free-reward prompt checks at modest intervals; avoids purchases.", function()
-        if claim.enabled then return "Nearby auto-claim is already enabled." end
-        claim.enabled = true
-        claim.generation = claim.generation + 1
-        local generation = claim.generation
-        task.spawn(function()
-            while claim.enabled and generation == claim.generation do
-                pcall(claimNearby)
-                task.wait(5)
-            end
-        end)
-        return "Nearby free-reward auto-claim enabled (checks about every 5 seconds)."
-    end)
-    register("unprogautoclaim", {}, "unprogautoclaim", "Stop nearby free-reward prompt checks.", function()
-        claim.enabled = false
-        claim.generation = claim.generation + 1
-        return "Nearby auto-claim disabled; " .. claim.tries .. " attempts this session."
-    end)
-    register("progshutdown", {}, "progshutdown", "Stop all Progression Lab loops, auto-equipping, reward prompts and objective highlights.", function()
-        stop("Progression Lab stopped by user")
-        claim.enabled = false
-        claim.generation = claim.generation + 1
-        toolAssist.enabled = false
-        if toolAssist.connection then toolAssist.connection:Disconnect() toolAssist.connection = nil end
-        PROG.markerMode = false
-        refreshMarkers()
-        PROG.overlayVisible = false
-        if PROG.overlay then PROG.overlay.Visible = false end
-        return "All progression background features and highlights shut down."
-    end)
-
-    -- Incremental objective discovery avoids full rescans whenever a farm respawns items.
-    local lastMarkerUpdate = 0
-    world.DescendantAdded:Connect(function(obj)
-        if not obj:IsA("BasePart") or PROG.candidates[obj] then return end
-        if PROG.indexCount >= PROG.candidateLimit then return end
-        local added = {}
-        if addCandidate(obj, added) then
-            PROG.candidates[obj] = added[obj]
-            PROG.indexCount = PROG.indexCount + 1
-            if PROG.markerMode and os.clock() - lastMarkerUpdate > 3 then
-                lastMarkerUpdate = os.clock()
-                task.defer(refreshMarkers)
-            end
-        end
-    end)
-    world.DescendantRemoving:Connect(function(obj)
-        if PROG.candidates[obj] then
-            PROG.candidates[obj] = nil
-            PROG.indexCount = math.max(0, PROG.indexCount - 1)
-        end
-    end)
-
-    -- Track the rate of the selected stat only while the hub or autopilot is in use.
-    task.spawn(function()
-        while true do
-            if PROG.running or PROG.overlayVisible then
-                sampleTracked()
-            end
-            task.wait(2)
-        end
-    end)
-    player.CharacterAdded:Connect(function()
-        if PROG.running then
-            log("Character respawn detected; autopilot will resume after root becomes ready")
-        end
-    end)
-    IndexContents("", true)
-    log("Progression Lab loaded: discover, route, verify and farm")
-end
-
---[[
-  INFINITE YIELD NOVA | ADVANCED CHEAT PACK
-  Adds bounded, reversible client-side gameplay abilities.
-  Client authority is limited: server-validated rewards/stages are not guaranteed.
-  No remote discovery, purchases, or anti-cheat evasion.
-]]
-do
-    local plr = Players.LocalPlayer
-    local world = workspace
-    local runService = RunService
-    local inv = plr:FindFirstChildOfClass("Backpack") or plr:WaitForChild("Backpack", 10)
-    local controller = {
-        generation = {}, active = {}, errors = {},
-        toolInterval = 0.25, cycleInterval = 0.6,
-        promptFilter = "", clickFilter = "", touchFilter = "",
-        promptCooldowns = setmetatable({}, {__mode = "k"}),
-        clickCooldowns = setmetatable({}, {__mode = "k"}),
-        touchCooldowns = setmetatable({}, {__mode = "k"}),
-        phaseOriginals = setmetatable({}, {__mode = "k"}),
-        lootHighlights = {}, stageFailures = 0,
-        restorableGravity = nil, gravityTarget = nil,
-        stats = {tools = 0, prompts = 0, clicks = 0, touches = 0, stages = 0},
-    }
-    _G.IY_NOVA_ADVANCED = controller
-    local added = 0
-    local function bounded(v, fallback, minimum, maximum)
-        local n = tonumber(v)
-        if not n or n ~= n or n == math.huge or n == -math.huge then n = fallback end
-        return math.clamp(n, minimum, maximum)
-    end
-    local function norm(v)
-        return tostring(v or ""):lower():sub(1, 65):match("^%s*(.-)%s*$") or ""
-    end
-    local function charRoot()
-        local c = plr.Character
-        local h = c and c:FindFirstChildOfClass("Humanoid")
-        local r = c and (c:FindFirstChild("HumanoidRootPart") or (h and h.RootPart))
-        if c and h and r and h.Health > 0 then return c, h, r end
-        return nil
-    end
-    local function stop(name)
-        controller.active[name] = nil
-        controller.generation[name] = (controller.generation[name] or 0) + 1
-    end
-    local function start(name, interval, callback)
-        stop(name)
-        controller.active[name] = true
-        local rev = controller.generation[name]
-        task.spawn(function()
-            local errors = 0
-            while controller.active[name] and controller.generation[name] == rev do
-                local ok, err = pcall(callback)
-                if not ok then
-                    errors = errors + 1
-                    controller.errors[name] = tostring(err):sub(1, 110)
-                    if errors >= 4 then
-                        stop(name)
-                        warn("[NOVA Advanced] disabled " .. name .. ": " .. tostring(err))
-                        break
-                    end
-                else
-                    errors = 0
-                end
-                task.wait(interval)
-            end
-        end)
-    end
-    local function reg(name, aliases, usage, description, callback)
-        if findCmd(name) then return end
-        local valid = {}
-        for _, alias in ipairs(aliases or {}) do
-            if not findCmd(alias) then table.insert(valid, alias) end
-        end
-        addcmd(name, valid, callback)
-        addcmdtext(usage, "NOVA ADVANCED", description)
-        added = added + 1
-    end
-    local function sourceName(inst)
-        local parent = inst.Parent
-        local grand = parent and parent.Parent
-        return norm(inst.Name .. " " .. (parent and parent.Name or "") .. " " .. (grand and grand.Name or ""))
-    end
-    local forbidden = {"buy", "purchase", "shop", "robux", "gamepass", "product", "donate", "donation", "pay", "upgrade", "premium", "trade", "sell", "delete", "discard", "reset", "rebirth"}
-    local function prohibited(s)
-        for _, term in ipairs(forbidden) do
-            if s:find(term, 1, true) then return true end
-        end
-        return false
-    end
-    local function nearby(radius, maxParts)
-        local c, _, root = charRoot()
-        if not root then return {}, nil end
-        local overlap = OverlapParams.new()
-        overlap.FilterType = Enum.RaycastFilterType.Exclude
-        overlap.FilterDescendantsInstances = {c}
-        overlap.MaxParts = maxParts or 250
-        local ok, parts = pcall(function()
-            return world:GetPartBoundsInRadius(root.Position, radius, overlap)
-        end)
-        return ok and parts or {}, root
-    end
-    local function ownedTools()
-        local list = {}
-        local c = plr.Character
-        for _, folder in ipairs({c, inv}) do
-            if folder then
-                for _, obj in ipairs(folder:GetChildren()) do
-                    if obj:IsA("Tool") then table.insert(list, obj) end
-                end
-            end
-        end
-        return list
-    end
-    local function equippedTool()
-        local c = plr.Character
-        return c and c:FindFirstChildOfClass("Tool")
-    end
-    local function performTool(tool)
-        if not tool or not tool.Parent then return end
-        local ok = pcall(function() tool:Activate() end)
-        if ok then controller.stats.tools = controller.stats.tools + 1 end
-    end
-
-    -- Automatic tools, useful for clicker and collection games exposing a Tool.Activate workflow.
-    reg("toolspam", {"autouse"}, "toolspam [interval]", "Auto-activate the equipped tool (0.12-5 seconds).", function(a)
-        local interval = bounded(a[1], 0.25, 0.12, 5)
-        controller.toolInterval = interval
-        stop("toolcycle")
-        start("toolspam", interval, function() performTool(equippedTool()) end)
-        return string.format("Tool activation enabled every %.2f seconds.", interval)
-    end)
-    reg("untoolspam", {"unautouse"}, "untoolspam", "Stop automatically activating the equipped tool.", function()
-        stop("toolspam")
-        return "Automatic tool activation disabled."
-    end)
-    local cycleIndex = 0
-    reg("toolcycle", {}, "toolcycle [interval]", "Cycle through owned tools, equipping and activating each in turn.", function(a)
-        local interval = bounded(a[1], 0.65, 0.3, 6)
-        controller.cycleInterval = interval
-        stop("toolspam")
-        cycleIndex = 0
-        start("toolcycle", interval, function()
-            local _, h = charRoot()
-            if not h then return end
-            local tools = ownedTools()
-            if #tools == 0 then return end
-            table.sort(tools, function(a, b) return a.Name < b.Name end)
-            cycleIndex = (cycleIndex % #tools) + 1
-            local tool = tools[cycleIndex]
-            pcall(function() h:EquipTool(tool) end)
-            if tool.Parent == plr.Character then performTool(tool) end
-        end)
-        return "Tool cycling started (" .. interval .. "s)."
-    end)
-    reg("untoolcycle", {}, "untoolcycle", "Stop tool cycling and activation.", function()
-        stop("toolcycle")
-        return "Tool cycling disabled."
-    end)
-
-    -- Nearby actions: bounded, low-rate, with purchase and destructive action exclusions.
-    local function validPrompt(prompt, root, radius)
-        if not prompt.Enabled or not prompt.Parent then return false end
-        local parent = prompt.Parent
-        local pos = parent:IsA("Attachment") and parent.WorldPosition or parent:IsA("BasePart") and parent.Position
-        if not pos then return false end
-        local dist = (root.Position - pos).Magnitude
-        if dist > radius or dist > prompt.MaxActivationDistance + 0.5 then return false end
-        local name = sourceName(prompt) .. " " .. norm(prompt.ActionText) .. " " .. norm(prompt.ObjectText)
-        if prohibited(name) then return false end
-        if controller.promptFilter ~= "" and not name:find(controller.promptFilter, 1, true) then return false end
-        return true
-    end
-    local function promptsInRange(radius, limit)
-        local parts, root = nearby(radius, 200)
-        if not root then return {}, nil end
-        local prompts, seen = {}, {}
-        for _, part in ipairs(parts) do
-            local items = part:GetDescendants()
-            for _, inst in ipairs(items) do
-                if inst:IsA("ProximityPrompt") and not seen[inst] then
-                    seen[inst] = true
-                    if validPrompt(inst, root, radius) then
-                        table.insert(prompts, inst)
-                        if #prompts >= limit then return prompts, root end
-                    end
-                end
-            end
-        end
-        return prompts, root
-    end
-    reg("promptfilter", {}, "promptfilter [keyword|clear]", "Restrict automated prompts by a name/action keyword.", function(a)
-        controller.promptFilter = norm(table.concat(a, " "))
-        if controller.promptFilter == "clear" then controller.promptFilter = "" end
-        return controller.promptFilter == "" and "Prompt filter cleared." or "Prompt filter: " .. controller.promptFilter
-    end)
-    reg("promptscan", {}, "promptscan [radius]", "List eligible prompts within normal interaction reach.", function(a)
-        local radius = bounded(a[1], 14, 4, 32)
-        local list = promptsInRange(radius, 12)
-        local names = {}
-        for _, prompt in ipairs(list) do table.insert(names, prompt.ObjectText ~= "" and prompt.ObjectText or prompt.Name) end
-        local message = #names > 0 and table.concat(names, ", ") or "No eligible prompts in reach."
-        notify("NOVA / PROMPT SCAN", message:sub(1, 420), 10)
-        return "Eligible nearby prompts: " .. #names
-    end)
-    reg("promptaura", {}, "promptaura [radius] [interval]", "Auto-activate eligible nearby prompts within their normal reach.", function(a)
-        local radius = bounded(a[1], 12, 4, 25)
-        local interval = bounded(a[2], 1.3, 0.6, 8)
-        local queue = {}
-        start("promptaura", interval, function()
-            local now = os.clock()
-            local prompts = promptsInRange(radius, 8)
-            for _, prompt in ipairs(prompts) do
-                if (controller.promptCooldowns[prompt] or 0) <= now then
-                    controller.promptCooldowns[prompt] = now + math.max(4, prompt.HoldDuration + 2)
-                    if prompt.HoldDuration <= 2.5 then
-                        table.insert(queue, prompt)
-                        break
-                    end
-                end
-            end
-            if #queue > 0 then
-                local prompt = table.remove(queue, 1)
-                if prompt and prompt.Parent and prompt.Enabled then
-                    pcall(function() prompt:InputHoldBegin() end)
-                    task.wait(math.min(prompt.HoldDuration + 0.12, 2.62))
-                    pcall(function() prompt:InputHoldEnd() end)
-                    controller.stats.prompts = controller.stats.prompts + 1
-                end
-            end
-        end)
-        return "Prompt aura started (normal reach only; purchase/destructive prompts skipped)."
-    end)
-    reg("unpromptaura", {}, "unpromptaura", "Disable automatic nearby prompt activation.", function()
-        stop("promptaura")
-        return "Prompt aura stopped."
-    end)
-
-    local clickAPI = type(fireclickdetector) == "function" and fireclickdetector or nil
-    local function clickables(radius, maxCount)
-        local parts, root = nearby(radius, 180)
-        if not root then return {} end
-        local list, found = {}, {}
-        for _, part in ipairs(parts) do
-            for _, item in ipairs(part:GetDescendants()) do
-                if item:IsA("ClickDetector") and not found[item] then
-                    found[item] = true
-                    local text = sourceName(item)
-                    local anchor = item.Parent
-                    local dist = anchor:IsA("BasePart") and (anchor.Position - root.Position).Magnitude or 1e9
-                    if dist <= radius and dist <= item.MaxActivationDistance + 0.5
-                        and not prohibited(text)
-                        and (controller.clickFilter == "" or text:find(controller.clickFilter, 1, true)) then
-                        table.insert(list, item)
-                        if #list >= maxCount then return list end
-                    end
-                end
-            end
-        end
-        return list
-    end
-    reg("clickfilter", {}, "clickfilter [keyword|clear]", "Restrict ClickDetector automation to matching names.", function(a)
-        controller.clickFilter = norm(table.concat(a, " "))
-        if controller.clickFilter == "clear" then controller.clickFilter = "" end
-        return controller.clickFilter == "" and "Click filter cleared." or "Click filter: " .. controller.clickFilter
-    end)
-    reg("clickscan", {}, "clickscan [radius]", "Count nearby ClickDetectors reachable by the player.", function(a)
-        local targets = clickables(bounded(a[1], 15, 4, 32), 30)
-        return #targets .. " eligible nearby ClickDetector(s)."
-    end)
-    reg("clickaura", {}, "clickaura [radius] [interval]", "Trigger nearby eligible ClickDetectors if supported by executor.", function(a)
-        if not clickAPI then return "Executor does not provide fireclickdetector." end
-        local radius = bounded(a[1], 13, 4, 30)
-        local interval = bounded(a[2], 1, 0.35, 8)
-        start("clickaura", interval, function()
-            local now = os.clock()
-            for _, item in ipairs(clickables(radius, 12)) do
-                if (controller.clickCooldowns[item] or 0) <= now then
-                    controller.clickCooldowns[item] = now + 2
-                    local ok = pcall(clickAPI, item)
-                    if ok then controller.stats.clicks = controller.stats.clicks + 1 end
-                    break
-                end
-            end
-        end)
-        return "Click aura enabled; targets must be in reach."
-    end)
-    reg("unclickaura", {}, "unclickaura", "Stop automatic ClickDetector activation.", function()
-        stop("clickaura")
-        return "Click aura stopped."
-    end)
-
-    local touchAPI = type(firetouchinterest) == "function" and firetouchinterest or nil
-    local pickupTerms = {"orb", "coin", "gem", "star", "token", "pickup", "loot", "collect", "drop", "crystal", "chest", "reward"}
-    local function touchables(radius, cap)
-        local parts, root = nearby(radius, 250)
-        if not root then return {}, nil end
-        local results = {}
-        for _, part in ipairs(parts) do
-            if part:IsA("BasePart") and part.CanTouch then
-                local name = sourceName(part)
-                local matching = controller.touchFilter ~= "" and name:find(controller.touchFilter, 1, true) ~= nil
-                if controller.touchFilter == "" then
-                    for _, token in ipairs(pickupTerms) do
-                        if name:find(token, 1, true) then matching = true break end
-                    end
-                end
-                if matching and not prohibited(name) and part ~= root and (part.Position - root.Position).Magnitude <= radius then
-                    table.insert(results, part)
-                    if #results >= cap then break end
-                end
-            end
-        end
-        return results, root
-    end
-    reg("touchfilter", {}, "touchfilter [keyword|clear]", "Restrict collectible-touch automation to a named item type.", function(a)
-        controller.touchFilter = norm(table.concat(a, " "))
-        if controller.touchFilter == "clear" then controller.touchFilter = "" end
-        return controller.touchFilter == "" and "Default collectible categories enabled." or "Touch filter: " .. controller.touchFilter
-    end)
-    reg("touchscan", {}, "touchscan [radius]", "Count nearby likely collectibles that could respond to touch.", function(a)
-        local radius = bounded(a[1], 12, 3, 28)
-        local parts = touchables(radius, 50)
-        return #parts .. " likely collectible part(s) within " .. radius .. " studs."
-    end)
-    reg("touchaura", {}, "touchaura [radius] [interval]", "Attempt touch collection on nearby named collectibles if supported.", function(a)
-        if not touchAPI then return "Executor does not provide firetouchinterest." end
-        local radius = bounded(a[1], 10, 3, 20)
-        local interval = bounded(a[2], 0.9, 0.35, 8)
-        start("touchaura", interval, function()
-            local parts, root = touchables(radius, 15)
-            if not root then return end
-            local now = os.clock()
-            local used = 0
-            for _, part in ipairs(parts) do
-                if (controller.touchCooldowns[part] or 0) < now then
-                    controller.touchCooldowns[part] = now + 3
-                    local ok = pcall(function()
-                        touchAPI(root, part, 0)
-                        touchAPI(root, part, 1)
-                    end)
-                    if ok then controller.stats.touches = controller.stats.touches + 1 end
-                    used = used + 1
-                    if used >= 3 then break end
-                end
-            end
-        end)
-        return "Collectible touch aura started; rewards depend on game/server logic."
-    end)
-    reg("untouchaura", {}, "untouchaura", "Disable collectible touch aura.", function()
-        stop("touchaura")
-        return "Collectible touch aura disabled."
-    end)
-
-    -- Movement locks: resilient across respawns, with explicit disable options.
-    local oldSpeed, oldJump, oldGravity
-    reg("speedlock", {}, "speedlock [walkspeed]", "Keep local WalkSpeed at a chosen value (8-130).", function(a)
-        local value = bounded(a[1], 32, 8, 130)
-        oldSpeed = nil
-        start("speedlock", 0.25, function()
-            local _, h = charRoot()
-            if h then
-                if oldSpeed == nil then oldSpeed = h.WalkSpeed end
-                if math.abs(h.WalkSpeed - value) > 0.01 then h.WalkSpeed = value end
-            end
-        end)
-        return "WalkSpeed lock enabled at " .. value .. "."
-    end)
-    reg("unspeedlock", {}, "unspeedlock", "Disable WalkSpeed lock and restore saved WalkSpeed.", function()
-        stop("speedlock")
-        local _, h = charRoot()
-        if h and oldSpeed then pcall(function() h.WalkSpeed = oldSpeed end) end
-        oldSpeed = nil
-        return "WalkSpeed lock disabled."
-    end)
-    reg("jumplock", {}, "jumplock [power]", "Keep local jump strength at a chosen value.", function(a)
-        local value = bounded(a[1], 80, 15, 200)
-        oldJump = nil
-        start("jumplock", 0.25, function()
-            local _, h = charRoot()
-            if h then
-                if oldJump == nil then oldJump = {use = h.UseJumpPower, power = h.JumpPower, height = h.JumpHeight} end
-                if h.UseJumpPower then h.JumpPower = value else h.JumpHeight = math.clamp(value / 10, 2, 35) end
-            end
-        end)
-        return "Jump lock enabled at " .. value .. " (game jump mode respected)."
-    end)
-    reg("unjumplock", {}, "unjumplock", "Disable Jump lock and restore original local jump settings.", function()
-        stop("jumplock")
-        local _, h = charRoot()
-        if h and oldJump then
-            pcall(function()
-                h.UseJumpPower = oldJump.use
-                h.JumpPower = oldJump.power
-                h.JumpHeight = oldJump.height
-            end)
-        end
-        oldJump = nil
-        return "Jump lock disabled."
-    end)
-    reg("gravitylock", {}, "gravitylock [gravity]", "Continuously enforce local gravity (0-196.2).", function(a)
-        local target = bounded(a[1], 70, 0, 196.2)
-        if oldGravity == nil then oldGravity = world.Gravity end
-        controller.gravityTarget = target
-        start("gravitylock", 0.25, function()
-            if math.abs(world.Gravity - target) > 0.01 then world.Gravity = target end
-        end)
-        return "Local gravity lock enabled at " .. target .. "."
-    end)
-    reg("ungravitylock", {}, "ungravitylock", "Disable gravity lock and restore the previous gravity.", function()
-        stop("gravitylock")
-        if oldGravity then pcall(function() world.Gravity = oldGravity end) end
-        oldGravity = nil
-        controller.gravityTarget = nil
-        return "Gravity lock disabled."
-    end)
-    reg("antistun", {}, "antistun", "Attempt recovery from local stun, sitting and PlatformStand states.", function()
-        start("antistun", 0.35, function()
-            local _, h = charRoot()
-            if not h then return end
-            if h.PlatformStand then h.PlatformStand = false end
-            local state = h:GetState()
-            if state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll then
-                h:ChangeState(Enum.HumanoidStateType.GettingUp)
-            end
-        end)
-        return "Anti-stun enabled; server-enforced stuns may still apply."
-    end)
-    reg("unantistun", {}, "unantistun", "Disable anti-stun monitoring.", function()
-        stop("antistun")
-        return "Anti-stun disabled."
-    end)
-    reg("autovault", {}, "autovault [distance]", "Auto-jump toward short obstacles when the space above is clear.", function(a)
-        local distance = bounded(a[1], 3.7, 2, 7)
-        local lastJump = 0
-        start("autovault", 0.15, function()
-            local c, h, root = charRoot()
-            if not c or h.FloorMaterial == Enum.Material.Air or os.clock() - lastJump < 0.7 then return end
-            if h.MoveDirection.Magnitude < 0.35 then return end
-            local direction = h.MoveDirection.Unit
-            local params = RaycastParams.new()
-            params.FilterType = Enum.RaycastFilterType.Exclude
-            params.FilterDescendantsInstances = {c}
-            local forward = world:Raycast(root.Position - Vector3.new(0, 1, 0), direction * distance, params)
-            if not forward then return end
-            local overhead = world:Raycast(root.Position + Vector3.new(0, 2.5, 0), direction * distance, params)
-            if not overhead then
-                lastJump = os.clock()
-                h:ChangeState(Enum.HumanoidStateType.Jumping)
-            end
-        end)
-        return "Automatic obstacle vaulting enabled."
-    end)
-    reg("unautovault", {}, "unautovault", "Disable automatic obstacle jumps.", function()
-        stop("autovault")
-        return "Auto-vault disabled."
-    end)
-
-    -- Gate phasing is intentionally selective: touching floors should remain walkable.
-    local phaseName, phaseRadius = "gate", 15
-    local function restorePhase()
-        for part, original in pairs(controller.phaseOriginals) do
-            if part and part.Parent then pcall(function() part.CanCollide = original end) end
-            controller.phaseOriginals[part] = nil
-        end
-    end
-    reg("phasegate", {}, "phasegate [keyword] [radius]", "Make nearby named gates/doors locally non-collidable.", function(a)
-        phaseName = norm(a[1])
-        if phaseName == "" then phaseName = "gate" end
-        if #phaseName < 3 then return "Use a keyword of at least 3 characters." end
-        phaseRadius = bounded(a[2], 15, 5, 45)
-        restorePhase()
-        start("phasegate", 0.5, function()
-            local parts = nearby(phaseRadius, 300)
-            local seen = {}
-            for _, part in ipairs(parts) do
-                if part:IsA("BasePart") and sourceName(part):find(phaseName, 1, true) then
-                    seen[part] = true
-                    if controller.phaseOriginals[part] == nil then controller.phaseOriginals[part] = part.CanCollide end
-                    if part.CanCollide then part.CanCollide = false end
-                end
-            end
-            for part, wasCollidable in pairs(controller.phaseOriginals) do
-                if not seen[part] then
-                    if part.Parent then pcall(function() part.CanCollide = wasCollidable end) end
-                    controller.phaseOriginals[part] = nil
-                end
-            end
-        end)
-        return "Local phase enabled for nearby objects matching: " .. phaseName
-    end)
-    reg("unphasegate", {}, "unphasegate", "Restore collision settings changed by phasegate.", function()
-        stop("phasegate")
-        restorePhase()
-        return "Local gate phasing disabled and collisions restored."
-    end)
-
-    -- Highlight containers / loot chests that tool ESP doesn't cover.
-    local glowTokens = {"chest", "crate", "treasure", "loot", "safe", "vault", "supply", "rare", "legendary", "mythic"}
-    local function clearGlow()
-        for object, highlight in pairs(controller.lootHighlights) do
-            pcall(function() highlight:Destroy() end)
-            controller.lootHighlights[object] = nil
-        end
-    end
-    reg("lootglow", {}, "lootglow [radius]", "Highlight nearby chests, loot crates and rare resources.", function(a)
-        local radius = bounded(a[1], 180, 25, 600)
-        clearGlow()
-        start("lootglow", 2, function()
-            local parts, root = nearby(radius, 700)
-            if not root then return end
-            local seen = {}
-            local count = 0
-            for _, part in ipairs(parts) do
-                if part:IsA("BasePart") then
-                    local name = sourceName(part)
-                    local okName = false
-                    for _, token in ipairs(glowTokens) do
-                        if name:find(token, 1, true) then okName = true break end
-                    end
-                    local target = part.Parent and part.Parent:IsA("Model") and part.Parent or part
-                    if okName and not prohibited(name) and not seen[target] then
-                        seen[target] = true
-                        if not controller.lootHighlights[target] then
-                            local hi = Instance.new("Highlight")
-                            hi.Name = "NOVA_AdvancedLootGlow"
-                            hi.Adornee = target
-                            hi.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                            hi.FillColor = Color3.fromRGB(255, 184, 70)
-                            hi.OutlineColor = Color3.fromRGB(255, 239, 165)
-                            hi.FillTransparency = 0.8
-                            hi.Parent = target
-                            controller.lootHighlights[target] = hi
-                        end
-                        count = count + 1
-                        if count >= 70 then break end
-                    end
-                end
-            end
-            for target, hi in pairs(controller.lootHighlights) do
-                if not target.Parent or not seen[target] then
-                    pcall(function() hi:Destroy() end)
-                    controller.lootHighlights[target] = nil
-                end
-            end
-        end)
-        return "Loot glow enabled (up to 70 nearby targets)."
-    end)
-    reg("unlootglow", {}, "unlootglow", "Remove chest / loot highlighting.", function()
-        stop("lootglow")
-        clearGlow()
-        return "Loot highlights removed."
-    end)
-
-    -- Rescue from a local collision trap, with conservative displacement checks.
-    local lastPosition, stillSince = nil, 0
-    reg("autounstuck", {}, "autounstuck", "Move slightly upward after 3 seconds stuck while walking.", function()
-        lastPosition, stillSince = nil, 0
-        start("autounstuck", 0.5, function()
-            local c, h, root = charRoot()
-            if not c then lastPosition = nil return end
-            if h.MoveDirection.Magnitude < 0.4 or h.FloorMaterial == Enum.Material.Air then
-                lastPosition, stillSince = root.Position, 0
-                return
-            end
-            if lastPosition and (root.Position - lastPosition).Magnitude < 0.65 then
-                if stillSince == 0 then stillSince = os.clock() end
-                if os.clock() - stillSince >= 3 then
-                    root.CFrame = root.CFrame + Vector3.new(0, 3.5, 0)
-                    stillSince = 0
-                end
-            else
-                lastPosition, stillSince = root.Position, 0
-            end
-        end)
-        return "Auto-unstuck enabled."
-    end)
-    reg("unautounstuck", {}, "unautounstuck", "Stop automatic unstuck attempts.", function()
-        stop("autounstuck")
-        lastPosition, stillSince = nil, 0
-        return "Auto-unstuck disabled."
-    end)
-
-    -- Checkpoint assistance: require a readable Stage stat and visible map parts.
-    local stageCache = {}
-    local stagePrefixes = {"checkpoint", "stage", "level"}
-    local function stageFromName(str)
-        str = norm(str)
-        for _, prefix in ipairs(stagePrefixes) do
-            local n = str:match("^" .. prefix .. "[%s_%-]*(%d+)$")
-            if n then return tonumber(n) end
-        end
-        return nil
-    end
-    local function refreshStages()
-        table.clear(stageCache)
-        local visited = 0
-        for _, obj in ipairs(world:GetDescendants()) do
-            visited = visited + 1
-            if visited > 26000 then break end
-            if obj:IsA("BasePart") then
-                local n = stageFromName(obj.Name) or (obj.Parent and obj.Parent:IsA("Model") and stageFromName(obj.Parent.Name))
-                if n and n >= 0 and n < 5000 and not stageCache[n] then stageCache[n] = obj end
-            end
-            if visited % 1200 == 0 then task.wait() end
-        end
-        local count = 0
-        for _ in pairs(stageCache) do count = count + 1 end
-        return count
-    end
-    local function getStage()
-        for _, folder in ipairs({plr:FindFirstChild("leaderstats"), plr:FindFirstChild("Data"), plr}) do
-            if folder then
-                for _, v in ipairs(folder:GetChildren()) do
-                    if v:IsA("IntValue") or v:IsA("NumberValue") then
-                        local name = norm(v.Name)
-                        if name == "stage" or name == "checkpoint" or name == "level" then
-                            return v.Value, v
-                        end
-                    end
-                end
-            end
-        end
-        return nil
-    end
-    local function moveToStage(n)
-        local c, _, root = charRoot()
-        local target = stageCache[n]
-        if not c or not target or not target.Parent then return false end
-        root.CFrame = CFrame.new(target.Position + Vector3.new(0, math.max(target.Size.Y / 2 + 3, 4), 0))
-        return true
-    end
-    reg("stagefinder", {}, "stagefinder", "Scan for numbered checkpoint parts and display the current Stage stat.", function()
-        local count = refreshStages()
-        local current = getStage()
-        return string.format("Found %d numbered stages. Reported stage: %s.", count, tostring(current or "not available"))
-    end)
-    reg("stageteleport", {"stp"}, "stageteleport [number|next]", "Locally move to a discovered numbered checkpoint.", function(a)
-        if next(stageCache) == nil then refreshStages() end
-        local stage = getStage()
-        local target = norm(a[1]) == "next" and (stage and math.floor(stage) + 1) or tonumber(a[1])
-        if not target or target < 0 or target > 4999 then return "Usage: stageteleport [checkpoint number|next]." end
-        if moveToStage(math.floor(target)) then return "Moved locally to visible stage " .. math.floor(target) .. "." end
-        return "Checkpoint part not found. Try stagefinder."
-    end)
-    reg("stageassist", {}, "stageassist", "Attempt the next visible stage; continue only after Stage stat increases.", function()
-        local stage = getStage()
-        if type(stage) ~= "number" then return "No numeric Stage/Checkpoint/Level stat found." end
-        if next(stageCache) == nil then refreshStages() end
-        controller.stageFailures = 0
-        local pending, lastStage = nil, stage
-        start("stageassist", 3.5, function()
-            local current = getStage()
-            if type(current) ~= "number" then stop("stageassist") return end
-            if pending then
-                if current > lastStage then
-                    controller.stats.stages = controller.stats.stages + (current - lastStage)
-                    controller.stageFailures = 0
-                    pending = nil
-                else
-                    controller.stageFailures = controller.stageFailures + 1
-                    if controller.stageFailures >= 2 then stop("stageassist") return end
-                end
-            end
-            lastStage = current
-            local n = math.floor(current) + 1
-            if not stageCache[n] or not stageCache[n].Parent then refreshStages() end
-            local _, _, root = charRoot()
-            local part = stageCache[n]
-            if part and root and (part.Position - root.Position).Magnitude < 300 then
-                pending = n
-                moveToStage(n)
-            else
-                stop("stageassist")
-            end
-        end)
-        return "Stage assist enabled. It stops after repeated unverified checkpoint attempts."
-    end)
-    reg("unstageassist", {}, "unstageassist", "Stop checkpoint progression assistance.", function()
-        stop("stageassist")
-        return "Stage assist disabled."
-    end)
-
-    reg("cheatstatus", {}, "cheatstatus", "Show active advanced cheats, attempted actions and errors.", function()
-        local active = {}
-        for name, enabled in pairs(controller.active) do
-            if enabled then table.insert(active, name) end
-        end
-        table.sort(active)
-        local count = controller.stats
-        local text = string.format("Active: %s\nTool uses: %d | Prompt attempts: %d | Clicks: %d | Touches: %d | Stages: %d",
-            #active == 0 and "none" or table.concat(active, ", "),
-            count.tools, count.prompts, count.clicks, count.touches, count.stages)
-        notify("NOVA ADVANCED STATUS", text, 12)
-        return text
-    end)
-    local function shutdown()
-        local keys = {}
-        for name in pairs(controller.active) do table.insert(keys, name) end
-        for _, name in ipairs(keys) do stop(name) end
-        restorePhase()
-        clearGlow()
-        if oldGravity then pcall(function() world.Gravity = oldGravity end) end
-        oldGravity = nil
-        local _, h = charRoot()
-        if h then
-            if oldSpeed then pcall(function() h.WalkSpeed = oldSpeed end) end
-            if oldJump then
-                pcall(function()
-                    h.UseJumpPower = oldJump.use
-                    h.JumpPower = oldJump.power
-                    h.JumpHeight = oldJump.height
-                end)
-            end
-        end
-        oldSpeed, oldJump = nil, nil
-    end
-    reg("cheatshutdown", {}, "cheatshutdown", "Stop every advanced-cheat loop, restore changed physics and remove highlights.", function()
-        shutdown()
-        return "Advanced cheats disabled; tracked local physics restored."
-    end)
-    reg("cheathelp", {"advancedcheats"}, "cheathelp", "Show the new advanced cheat categories and sample commands.", function()
-        notify("NOVA ADVANCED", "Tools: toolspam, toolcycle\nInteractions: promptaura, clickaura, touchaura (+ filters/scans)\nMovement: speedlock, jumplock, gravitylock, antistun, autovault, phasegate, autounstuck\nProgress: lootglow, stagefinder, stageteleport, stageassist\nControl: cheatstatus, cheatshutdown", 16)
-        return "Use F2 / Ctrl+K to search advanced cheats, or cheatstatus to inspect active modules."
-    end)
-    -- Ensure no loops from the new pack remain active after the player leaves the game.
-    plr.AncestryChanged:Connect(function(_, parent)
-        if parent == nil then shutdown() end
-    end)
-    IndexContents("", true)
-    if _G.IY_DEBUG then print("[NOVA Advanced] Registered", added, "commands") end
-end
-
---[[ NOVA STUDIO | exploration, navigation and command UX (client-side only) ]]
-do
-    local plr = Players.LocalPlayer
-    local runtime = {beacon = nil, beaconConnection = nil, pathToken = 0,
-        pathRunning = false, burstToken = 0, burstSpeed = nil,
-        status = "Idle"}
-    _G.IY_NOVA_STUDIO = runtime
-    local newCommands = 0
-    local function register(name, aliases, usage, detail, callback)
-        if findCmd(name) then
-            if _G.IY_DEBUG then warn("[NOVA Studio] Existing name: " .. name) end
-            return
-        end
-        local valid = {}
-        for _, alias in ipairs(aliases or {}) do
-            if not findCmd(alias) then table.insert(valid, alias) end
-        end
-        addcmd(name, valid, callback)
-        addcmdtext(usage, "NOVA STUDIO", detail)
-        newCommands = newCommands + 1
-    end
-    local function root()
-        local char = plr.Character
-        return char and char:FindFirstChild("HumanoidRootPart"), char
-    end
-    local function meHumanoid()
-        local char = plr.Character
-        return char and char:FindFirstChildOfClass("Humanoid")
-    end
-    local function nameOf(inst)
-        return tostring(inst.Name or ""):lower()
-    end
-    local function visibleTarget(inst)
-        return inst and inst:IsA("BasePart") and inst:IsDescendantOf(workspace)
-            and not (plr.Character and inst:IsDescendantOf(plr.Character))
-    end
-    local function collectible(inst)
-        local name = nameOf(inst)
-        return name:find("orb", 1, true) or name:find("coin", 1, true)
-            or name:find("gem", 1, true) or name:find("token", 1, true)
-            or name:find("loot", 1, true) or name:find("chest", 1, true)
-            or name:find("pickup", 1, true) or name:find("reward", 1, true)
-    end
-    local function findNearby(keyword, radius, onlyCollectibles)
-        local rp = root()
-        if not rp then return {} end
-        local list = {}
-        keyword = tostring(keyword or ""):lower()
-        radius = math.clamp(tonumber(radius) or 250, 10, 1200)
-        local visited = 0
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            visited = visited + 1
-            if visited > 50000 then break end -- no infinite unbounded scans
-            if visibleTarget(obj) and (keyword == "" or nameOf(obj):find(keyword, 1, true))
-                and (not onlyCollectibles or collectible(obj)) then
-                local dist = (obj.Position - rp.Position).Magnitude
-                if dist <= radius then
-                    table.insert(list, {part=obj, distance=dist})
-                end
-            end
-        end
-        table.sort(list, function(a, b) return a.distance < b.distance end)
-        return list
-    end
-    local function ui(section)
-        local api = _G.IY_NOVA_UI
-        if api and type(api.open) == "function" then api.open(section) return true end
-        return false
-    end
-    register("novahome", {"novacenter", "novastudio"}, "novahome", "Open the redesigned NOVA command center.", function()
-        ui("All")
-    end)
-    register("novacore", {}, "novacore", "Show only original Infinite Yield commands.", function()
-        ui("Infinite Yield")
-    end)
-    register("novanew", {}, "novanew", "Show all added NOVA commands, separate from IY.", function()
-        ui("NOVA Additions")
-    end)
-    register("novascope", {"novascout"}, "novascope [radius]", "Scan local world interactables, items and objectives.", function(args)
-        local rp = root()
-        if not rp then return "Character not ready." end
-        local radius = math.clamp(tonumber(args[1]) or 150, 15, 900)
-        local out = {parts=0, collectibles=0, prompts=0, detectors=0, tools=0}
-        local n = 0
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            n = n + 1
-            if n > 50000 then break end
-            if obj:IsA("BasePart") and (obj.Position-rp.Position).Magnitude <= radius then
-                out.parts = out.parts + 1
-                if collectible(obj) then out.collectibles = out.collectibles + 1 end
-            elseif obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector") or obj:IsA("Tool") then
-                local ancestor = obj.Parent
-                local pos = ancestor and (ancestor:IsA("BasePart") and ancestor.Position
-                    or ancestor:IsA("Model") and ancestor:GetPivot().Position)
-                if pos and (pos-rp.Position).Magnitude <= radius then
-                    if obj:IsA("ProximityPrompt") then out.prompts = out.prompts + 1
-                    elseif obj:IsA("ClickDetector") then out.detectors = out.detectors + 1
-                    else out.tools = out.tools + 1 end
-                end
-            end
-        end
-        return string.format("Within %d studs: %d parts, %d collectibles, %d prompts, %d click detectors, %d tools.",
-            radius, out.parts, out.collectibles, out.prompts, out.detectors, out.tools)
-    end)
-    register("novanear", {"novapickups"}, "novanear [radius] [name]", "Show the closest 8 collectible-like objects with distances.", function(args)
-        local radius = math.clamp(tonumber(args[1]) or 250, 10, 1200)
-        local keyword = table.concat(args, " ", 2)
-        local items = findNearby(keyword, radius, true)
-        if #items == 0 then return "No matching collectible-like objects nearby." end
-        local lines = {}
-        for i = 1, math.min(8, #items) do
-            local entry = items[i]
-            lines[i] = string.format("%d. %s  (%.0f studs)", i, entry.part.Name:sub(1, 35), entry.distance)
-        end
-        notify("NOVA / NEARBY OBJECTIVES (" .. #items .. ")", table.concat(lines, "\n"), 16)
-    end)
-    local function stopBeacon()
-        if runtime.beaconConnection then runtime.beaconConnection:Disconnect(); runtime.beaconConnection = nil end
-        if runtime.beacon then runtime.beacon:Destroy(); runtime.beacon = nil end
-    end
-    register("novabeacon", {"trackobject"}, "novabeacon [object name]", "Highlight the nearest named world object and show distance.", function(args)
-        local key = table.concat(args, " ")
-        if key == "" then return "Usage: novabeacon [object name]" end
-        local near = findNearby(key, 1200, false)
-        if #near == 0 then return "No matching world object within 1200 studs." end
-        stopBeacon()
-        local part = near[1].part
-        local gui = Instance.new("BillboardGui")
-        gui.Name = "NOVA_Beacon"
-        gui.Adornee = part
-        gui.AlwaysOnTop = true
-        gui.Size = UDim2.fromOffset(190, 52)
-        gui.StudsOffsetWorldSpace = Vector3.new(0, 4, 0)
-        gui.Parent = part
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.fromScale(1, 1)
-        label.BackgroundColor3 = Color3.fromRGB(16, 24, 42)
-        label.BackgroundTransparency = 0.18
-        label.TextColor3 = Color3.fromRGB(238, 246, 255)
-        label.TextSize = 13
-        label.Font = Enum.Font.GothamBold
-        label.TextWrapped = true
-        label.Parent = gui
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 9)
-        corner.Parent = label
-        local line = Instance.new("UIStroke")
-        line.Color = Color3.fromRGB(101, 157, 255)
-        line.Thickness = 1.5
-        line.Parent = label
-        runtime.beacon = gui
-        local elapsed = 0
-        runtime.beaconConnection = RunService.Heartbeat:Connect(function(dt)
-            elapsed = elapsed + dt
-            if elapsed < 0.35 then return end
-            elapsed = 0
-            local rp = root()
-            if not gui.Parent or not part:IsDescendantOf(workspace) then stopBeacon(); return end
-            local dist = rp and (rp.Position - part.Position).Magnitude or 0
-            label.Text = "◆ " .. part.Name:sub(1, 26) .. "\n" .. math.floor(dist) .. " STUDS"
-        end)
-        return "Beacon tracking " .. part.Name .. " (local visual only)."
-    end)
-    register("unnovabeacon", {"untrackobject"}, "unnovabeacon", "Remove the objective beacon and its update connection.", function()
-        stopBeacon()
-        return "Beacon removed."
-    end)
-    register("novapath", {"novawalkto"}, "novapath [object name]", "Pathfind on foot to the nearest named world object.", function(args)
-        local key = table.concat(args, " ")
-        if key == "" then return "Usage: novapath [object name]" end
-        if runtime.pathRunning then return "Navigation is already running. Use unnovapath first." end
-        local near = findNearby(key, 800, false)
-        if #near == 0 then return "No matching object within 800 studs." end
-        local target = near[1].part
-        runtime.pathToken = runtime.pathToken + 1
-        local token = runtime.pathToken
-        runtime.pathRunning = true
-        runtime.status = "Pathfinding to " .. target.Name
-        task.spawn(function()
-            local ok, err = pcall(function()
-                local rp = root()
-                local hum = meHumanoid()
-                if not rp or not hum then return end
-                local path = PathService:CreatePath({AgentCanJump=true})
-                path:ComputeAsync(rp.Position, target.Position)
-                if token ~= runtime.pathToken or path.Status ~= Enum.PathStatus.Success then
-                    runtime.status = "No safe walkable path"
-                    return
-                end
-                for _, point in ipairs(path:GetWaypoints()) do
-                    if token ~= runtime.pathToken or hum.Health <= 0 then break end
-                    if point.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
-                    hum:MoveTo(point.Position)
-                    -- MoveToFinished:Wait() is not cancellable; poll with a
-                    -- distance-based timeout so unnovapath reacts immediately.
-                    local waypointStart = os.clock()
-                    local initialDistance = (rp.Position - point.Position).Magnitude
-                    local timeout = math.clamp(initialDistance / math.max(4, hum.WalkSpeed) + 2, 3, 13)
-                    local reached = false
-                    while token == runtime.pathToken and hum.Parent and hum.Health > 0 do
-                        if not rp.Parent then break end
-                        if (rp.Position - point.Position).Magnitude <= 3.5 then
-                            reached = true
-                            break
-                        end
-                        if os.clock() - waypointStart > timeout then break end
-                        task.wait(0.08)
-                    end
-                    if token ~= runtime.pathToken or not reached then
-                        if token == runtime.pathToken then runtime.status = "Path blocked or timed out" end
-                        break
-                    end
-                end
-                if token == runtime.pathToken then runtime.status = "Navigation finished" end
-            end)
-            if not ok then runtime.status = "Navigation error: " .. tostring(err):sub(1, 70) end
-            if token == runtime.pathToken then runtime.pathRunning = false end
-        end)
-        return "Walking toward " .. target.Name .. ". Use unnovapath to stop."
-    end)
-    register("unnovapath", {"novapathstop"}, "unnovapath", "Cancel the current smart navigation route.", function()
-        runtime.pathToken = runtime.pathToken + 1
-        runtime.pathRunning = false
-        local hum = meHumanoid()
-        local rp = root()
-        if hum and rp then pcall(function() hum:MoveTo(rp.Position) end) end
-        runtime.status = "Navigation cancelled"
-        return runtime.status
-    end)
-    register("novastatview", {"novaleaderstats"}, "novastatview", "Show the numeric statistics currently visible to the client.", function()
-        local statFolder = plr:FindFirstChild("leaderstats")
-        if not statFolder then return "No leaderstats folder was found." end
-        local values = {}
-        for _, item in ipairs(statFolder:GetChildren()) do
-            if item:IsA("ValueBase") then
-                table.insert(values, item.Name .. ": " .. tostring(item.Value):sub(1, 30))
-            end
-        end
-        table.sort(values)
-        if #values == 0 then return "leaderstats has no directly visible ValueBase entries." end
-        notify("NOVA / CURRENT STATS", table.concat(values, "\n"):sub(1, 750), 13)
-    end)
-    register("novatoolview", {"novainventory"}, "novatoolview", "Inspect all equipped and backpack tools at once.", function()
-        local entries = {}
-        local char = plr.Character
-        local backpack = plr:FindFirstChildOfClass("Backpack")
-        for _, holder in ipairs({char, backpack}) do
-            if holder then
-                for _, item in ipairs(holder:GetChildren()) do
-                    if item:IsA("Tool") then
-                        local a = item:GetAttributes()
-                        local attrs = {}
-                        for k,v in pairs(a) do
-                            if type(v) == "number" then table.insert(attrs, tostring(k) .. "=" .. tostring(v)) end
-                            if #attrs >= 2 then break end
-                        end
-                        table.insert(entries, (holder==char and "[E] " or "[B] ")
-                            .. item.Name:sub(1, 27) .. (#attrs>0 and " (" .. table.concat(attrs, ",") .. ")" or ""))
-                    end
-                end
-            end
-        end
-        if #entries == 0 then return "No tools found in inventory." end
-        table.sort(entries)
-        notify("NOVA / INVENTORY (" .. #entries .. ")", table.concat(entries, "\n"):sub(1, 820), 14)
-    end)
-    register("novaspeedburst", {"novaburst"}, "novaspeedburst [speed] [seconds]", "Apply a short local sprint burst, then restore speed.", function(args)
-        local hum = meHumanoid()
-        if not hum then return "Character is not ready." end
-        local speed = math.clamp(tonumber(args[1]) or 35, 16, 75)
-        local duration = math.clamp(tonumber(args[2]) or 3, 0.5, 12)
-        runtime.burstToken = runtime.burstToken + 1
-        local token = runtime.burstToken
-        local original = runtime.burstSpeed or hum.WalkSpeed
-        runtime.burstSpeed = original
-        hum.WalkSpeed = speed
-        task.delay(duration, function()
-            if token == runtime.burstToken then
-                -- Restore only the humanoid that received the temporary boost.
-                if hum.Parent and hum == meHumanoid() then hum.WalkSpeed = original end
-                runtime.burstSpeed = nil
-            end
-        end)
-        return string.format("Local sprint burst: %.0f speed for %.1fs", speed, duration)
-    end)
-    register("unnovaburst", {"novaburststop"}, "unnovaburst", "End a temporary NOVA speed burst and restore speed.", function()
-        runtime.burstToken = runtime.burstToken + 1
-        local hum = meHumanoid()
-        if hum and runtime.burstSpeed then hum.WalkSpeed = runtime.burstSpeed end
-        runtime.burstSpeed = nil
-        return "Sprint burst stopped."
-    end)
-    register("novacmdcount", {"novasources"}, "novacmdcount", "Count original IY commands separately from NOVA additions.", function()
-        local api = _G.IY_NOVA_UI
-        if api and api.counts then
-            local original, added = api.counts()
-            return string.format("Infinite Yield: %d commands | NOVA: %d additions | Total: %d", original, added, original + added)
-        end
-        return "Command provenance is unavailable."
-    end)
-    register("novastudiostatus", {}, "novastudiostatus", "Show navigation, beacon and short-burst status.", function()
-        return string.format("Navigation: %s | Beacon: %s | Burst: %s",
-            runtime.status, runtime.beacon and "on" or "off", runtime.burstSpeed and "on" or "off")
-    end)
-    register("novastopall", {"novastudioshutdown"}, "novastopall", "Stop Studio navigation, beacons and movement bursts.", function()
-        runtime.pathToken = runtime.pathToken + 1
-        runtime.pathRunning = false
-        local hum = meHumanoid()
-        local rp = root()
-        if hum and rp then pcall(function() hum:MoveTo(rp.Position) end) end
-        stopBeacon()
-        runtime.burstToken = runtime.burstToken + 1
-        if hum and runtime.burstSpeed then hum.WalkSpeed = runtime.burstSpeed end
-        runtime.burstSpeed = nil
-        runtime.status = "Stopped"
-        return "All NOVA Studio activity stopped."
-    end)
-    -- A temporary speed lease must not affect the replacement character.
-    plr.CharacterAdded:Connect(function()
-        runtime.burstToken = runtime.burstToken + 1
-        runtime.burstSpeed = nil
-        runtime.pathToken = runtime.pathToken + 1
-        runtime.pathRunning = false
-        runtime.status = "Character respawned; navigation cancelled"
-    end)
-    -- Remove local adornments and stop loops if the character/session exits.
-    plr.AncestryChanged:Connect(function(_, parent)
-        if parent == nil then
-            runtime.pathToken = runtime.pathToken + 1
-            runtime.burstToken = runtime.burstToken + 1
-            stopBeacon()
-        end
-    end)
-    IndexContents("", true)
-    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then _G.IY_NOVA_UI.refresh() end
-    if _G.IY_DEBUG then print("[NOVA Studio] Registered", newCommands, "commands") end
-end
-
-
---[[
- NOVA UNIVERSAL REBUILD | 2026-11
- Post-registration command upgrade and audit layer.
- Command definitions remain available under their original names and aliases.
- The protective wrapper instruments every command individually; explicit rewrites
- below fix commands with confirmed correctness/performance problems.
- No attempt is made to bypass server-side game authority.
-]]
-do
-    local RB = {
-        version = "2.0.0", started = os.clock(), commands = {}, logs = {},
-        patches = {}, wrapped = {}, connections = {}, states = {},
-        cap = 140, auditCount = 0, patchCount = 0
-    }
-    _G.IY_NOVA_REBUILD = RB
-
-    local me = Players.LocalPlayer
-    local function log(name, err)
-        table.insert(RB.logs, 1, {name = tostring(name), error = tostring(err), at = os.time()})
-        if #RB.logs > 70 then table.remove(RB.logs) end
-        local shared = _G.IY_NOVA_ERRORS
-        if type(shared) ~= "table" then shared = {}; _G.IY_NOVA_ERRORS = shared end
-        table.insert(shared, 1, {command = tostring(name), message = tostring(err), timestamp = os.time()})
-        if #shared > 60 then table.remove(shared) end
-        if _G.IY_DEBUG then warn("[NOVA rebuild]", name, err) end
-    end
-    local function disconnect(which)
-        local old = RB.connections[which]
-        RB.connections[which] = nil
-        if old then pcall(function() old:Disconnect() end) end
-    end
-    local function human(player)
-        player = player or me
-        local char = player and player.Character
-        return char and char:FindFirstChildWhichIsA("Humanoid"), char
-    end
-    local function root(player)
-        local _, char = human(player)
-        return char and (getRoot(char) or char:FindFirstChild("HumanoidRootPart"))
-    end
-    local function finite(raw, default, low, high, label)
-        if raw == nil or raw == "" then return default end
-        local n = tonumber(raw)
-        if not n or n ~= n or n == math.huge or n == -math.huge then
-            return nil, (label or "Number") .. " must be finite and numeric."
-        end
-        if low and (n < low or n > high) then
-            return nil, string.format("%s must be between %s and %s.", label or "Number", tostring(low), tostring(high))
-        end
-        return n
-    end
-    local function withHumanoid(args, player, label, default, low, high, property)
-        local hum = human(player)
-        if not hum then return "A live character with a Humanoid is required." end
-        local number, issue = finite(args[1], default, low, high, label)
-        if not number then return issue end
-        hum[property] = number
-        return string.format("%s: %g", label, number)
-    end
-    local function stateType(raw)
-        if raw == nil then return nil end
-        local wanted = tostring(raw):lower()
-        for _, state in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
-            if state.Name:lower() == wanted or tostring(state.Value) == wanted then return state end
-        end
-        return nil
-    end
-    local function patch(name, reason, implementation)
-        local cmd = findCmd(name)
-        if not cmd or tostring(cmd.NAME):lower() ~= name:lower() then
-            log("patch:" .. name, "Missing command")
-            return
-        end
-        cmd.FUNC = implementation
-        RB.patches[name] = reason
-        RB.patchCount = RB.patchCount + 1
-    end
-    local function note(name, text)
-        if not RB.commands[name] then RB.commands[name] = {calls = 0, failures = 0, totalMs = 0, worstMs = 0} end
-        RB.commands[name].note = text
-    end
-
-    -- BUGFIX 01: the original numeric callbacks pass raw string arguments to
-    -- property setters.  All rewrites convert and validate before assignment.
-    patch("speed", "typed WalkSpeed; preserve optional second-argument syntax", function(args, player)
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local number, err = finite(args[2] or args[1], 16, 0, 5000, "WalkSpeed")
-        if not number then return err end
-        hum.WalkSpeed = number
-        return "WalkSpeed set to " .. tostring(number)
-    end)
-    patch("jpower", "validate and use Humanoid jump mode", function(args, player)
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local number, err = finite(args[1], hum.UseJumpPower and 50 or 7.2, 0, 1000, "Jump")
-        if not number then return err end
-        if hum.UseJumpPower then hum.JumpPower = number else hum.JumpHeight = number end
-        return "Jump set to " .. tostring(number)
-    end)
-    patch("gravity", "finite, bounded gravity", function(args)
-        local number, err = finite(args[1], oldgrav or 196.2, 0, 10000, "Gravity")
-        if not number then return err end
-        workspace.Gravity = number
-        return "Gravity set to " .. tostring(number)
-    end)
-    patch("hipheight", "nil-safe rig-aware hip height", function(args, player)
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local default = hum.RigType == Enum.HumanoidRigType.R15 and 2.1 or 0
-        local number, err = finite(args[1], default, -50, 500, "HipHeight")
-        if not number then return err end
-        hum.HipHeight = number
-        return "HipHeight set to " .. tostring(number)
-    end)
-    patch("maxslopeangle", "numeric property safety", function(args, player)
-        return withHumanoid(args, player, "MaxSlopeAngle", 89, 0, 89, "MaxSlopeAngle")
-    end)
-    patch("fov", "valid numeric FOV", function(args)
-        local camera = workspace.CurrentCamera
-        if not camera then return "No active camera." end
-        local value, err = finite(args[1], 70, 1, 120, "FieldOfView")
-        if not value then return err end
-        camera.FieldOfView = value
-        return "FOV set to " .. tostring(value)
-    end)
-    patch("brightness", "typed brightness with range checks", function(args)
-        local value, err = finite(args[1], 2, 0, 10, "Brightness")
-        if not value then return err end
-        Lighting.Brightness = value
-        return "Brightness set to " .. tostring(value)
-    end)
-    patch("ambient", "accept normalized colors or RGB values", function(args)
-        local rgb = {}
-        for i = 1, 3 do
-            local number, err = finite(args[i], nil, 0, 255, "RGB channel")
-            if not number then return err or "Usage: ambient [r] [g] [b]" end
-            rgb[i] = number
-        end
-        local color
-        if math.max(rgb[1], rgb[2], rgb[3]) <= 1 then
-            color = Color3.new(rgb[1], rgb[2], rgb[3])
-        else
-            color = Color3.fromRGB(rgb[1], rgb[2], rgb[3])
-        end
-        Lighting.Ambient, Lighting.OutdoorAmbient = color, color
-        return "Ambient color applied."
-    end)
-    patch("maxzoom", "keep camera min/max valid", function(args, player)
-        player = player or me
-        local n, err = finite(args[1], 128, 0.5, 1000, "Maximum zoom")
-        if not n then return err end
-        if player.CameraMinZoomDistance > n then player.CameraMinZoomDistance = n end
-        player.CameraMaxZoomDistance = n
-        return "Maximum zoom: " .. tostring(n)
-    end)
-    patch("minzoom", "keep camera min/max valid", function(args, player)
-        player = player or me
-        local n, err = finite(args[1], 0.5, 0.5, 1000, "Minimum zoom")
-        if not n then return err end
-        if player.CameraMaxZoomDistance < n then player.CameraMaxZoomDistance = n end
-        player.CameraMinZoomDistance = n
-        return "Minimum zoom: " .. tostring(n)
-    end)
-    patch("camdistance", "validate and restore camera zoom correctly", function(args, player)
-        player = player or me
-        local n, err = finite(args[1], 10, 0.5, 1000, "Camera distance")
-        if not n then return err end
-        local oldMin, oldMax = player.CameraMinZoomDistance, player.CameraMaxZoomDistance
-        player.CameraMinZoomDistance = math.min(oldMin, n)
-        player.CameraMaxZoomDistance = math.max(oldMax, n)
-        player.CameraMinZoomDistance = n
-        player.CameraMaxZoomDistance = n
-        -- Original command temporarily locks the camera; restore in the same task.
-        task.wait()
-        player.CameraMinZoomDistance = math.min(oldMin, oldMax)
-        player.CameraMaxZoomDistance = math.max(oldMin, oldMax)
-        return "Camera distance updated."
-    end)
-    patch("mousesensitivity", "finite mouse sensitivity", function(args)
-        local n, err = finite(args[1], 1, 0.01, 10, "Mouse sensitivity")
-        if not n then return err end
-        UserInputService.MouseDeltaSensitivity = n
-        return "Mouse sensitivity: " .. tostring(n)
-    end)
-    patch("tweenspeed", "finite tween duration", function(args)
-        local n, err = finite(args[1], 1, 0.05, 600, "Tween duration")
-        if not n then return err end
-        tweenSpeed = n
-        return "Tween duration: " .. tostring(n)
-    end)
-    patch("freecamspeed", "numeric camera movement speed", function(args)
-        local n, err = finite(args[1], 1, 0.1, 200, "Freecam speed")
-        if not n then return err end
-        NAV_KEYBOARD_SPEED = Vector3.new(n, n, n)
-        return "Freecam speed: " .. tostring(n)
-    end)
-    patch("enablestate", "correct Enum lookup and avoid local shadowing", function(args, player)
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local state = stateType(args[1])
-        if not state then return "Usage: enablestate [valid HumanoidStateType]" end
-        hum:SetStateEnabled(state, true)
-        return "Enabled state: " .. state.Name
-    end)
-    patch("disablestate", "correct Enum lookup and avoid local shadowing", function(args, player)
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local state = stateType(args[1])
-        if not state then return "Usage: disablestate [valid HumanoidStateType]" end
-        hum:SetStateEnabled(state, false)
-        return "Disabled state: " .. state.Name
-    end)
-    patch("setfpscap", "fix invalid 'none' handling; check API support", function(args)
-        if type(setfpscap) ~= "function" then return "setfpscap API unavailable in this environment." end
-        local text = tostring(args[1] or "60"):lower()
-        local value, err
-        if text == "none" or text == "unlimited" then value = 1000
-        else value, err = finite(text, 60, 10, 1000, "FPS cap") end
-        if not value then return err end
-        local ok, failure = pcall(setfpscap, value)
-        if not ok then return "FPS cap failed: " .. tostring(failure) end
-        return text == "none" and "FPS cap released (1000)." or "FPS cap: " .. tostring(value)
-    end)
-
-    -- BUGFIX 02: no duplicate lifecycle listeners, and proper restoration of
-    -- original CanCollide states instead of setting every recorded part to true.
-    local collisions = setmetatable({}, {__mode = "k"})
-    local function stopNoclip()
-        disconnect("noclip")
-        if Noclipping then pcall(function() Noclipping:Disconnect() end) end
-        Noclipping = nil
-        Clip = true
-        for part, previous in pairs(collisions) do
-            if part.Parent and part:IsA("BasePart") then
-                pcall(function() part.CanCollide = previous end)
-            end
-            collisions[part] = nil
-        end
-    end
-    patch("noclip", "stateful collision restoration and one loop", function(args, player)
-        stopNoclip()
-        Clip = false
-        Noclipping = RunService.Stepped:Connect(function()
-            local char = player and player.Character
-            if Clip or not char then return end
-            for _, part in ipairs(char:GetDescendants()) do
-                if part:IsA("BasePart") and part.CanCollide and part.Name ~= floatName then
-                    if collisions[part] == nil then collisions[part] = part.CanCollide end
-                    part.CanCollide = false
-                end
-            end
-        end)
-        RB.connections.noclip = Noclipping
-        if args[1] ~= "nonotify" then return "Noclip enabled." end
-    end)
-    patch("unnoclip", "restore exact prior collision states", function(args)
-        stopNoclip()
-        if args[1] ~= "nonotify" then return "Noclip disabled; original collisions restored." end
-    end)
-    patch("togglenoclip", "direct toggle without asynchronous races", function(args, player)
-        local fn = findCmd(Clip and "noclip" or "unnoclip")
-        if fn and fn.FUNC then return fn.FUNC(args, player) end
-    end)
-
-    -- BUGFIX 03: remove recursive listener registration and render-frame scans.
-    patch("autorejoin", "single error listener with duplicate prevention", function()
-        disconnect("autorejoin")
-        local lastTry = 0
-        RB.connections.autorejoin = GuiService.ErrorMessageChanged:Connect(function(message)
-            if type(message) ~= "string" or message == "" then return end
-            if os.clock() - lastTry < 12 then return end
-            lastTry = os.clock()
-            execCmd("rejoin")
-        end)
-        return "Auto rejoin enabled (one listener)."
-    end)
-    if not findCmd("unautorejoin") then
-        addcmd("unautorejoin", {"noautorejoin", "unautorj"}, function()
-            disconnect("autorejoin")
-            return "Auto rejoin disabled."
-        end)
-        addcmdtext("unautorejoin", "NOVA REBUILD", "Stop automatic reconnect attempts and clean up its listener.")
-    end
-
-    patch("infjump", "respawn-safe JumpRequest listener", function(args, player)
-        disconnect("infjump")
-        if infJump then pcall(function() infJump:Disconnect() end) end
-        local busy = false
-        infJump = UserInputService.JumpRequest:Connect(function()
-            if busy then return end
-            local hum = human(player)
-            if not hum or hum.Health <= 0 then return end
-            busy = true
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-            task.delay(0.08, function() busy = false end)
-        end)
-        RB.connections.infjump = infJump
-        return "Infinite jump enabled."
-    end)
-    patch("uninfjump", "disconnect JumpRequest reliably", function()
-        disconnect("infjump")
-        if infJump then pcall(function() infJump:Disconnect() end) end
-        infJump = nil
-        return "Infinite jump disabled."
-    end)
-    patch("autojump", "raycast on a throttled heartbeat", function(args, player)
-        disconnect("autojump")
-        if HumanModCons then
-            for _, key in ipairs({"ajLoop", "ajCA"}) do
-                if HumanModCons[key] then pcall(function() HumanModCons[key]:Disconnect() end); HumanModCons[key] = nil end
-            end
-        end
-        local elapsed = 0
-        RB.connections.autojump = RunService.Heartbeat:Connect(function(dt)
-            elapsed = elapsed + dt
-            if elapsed < 0.12 then return end
-            elapsed = 0
-            local hum = human(player)
-            local anchor = root(player)
-            if not hum or not anchor or hum.Health <= 0 then return end
-            if hum.MoveDirection.Magnitude < 0.05 then return end
-            local settings = RaycastParams.new()
-            settings.FilterType = Enum.RaycastFilterType.Exclude
-            settings.FilterDescendantsInstances = {player.Character}
-            local hit = workspace:Raycast(anchor.Position + Vector3.new(0, -1.2, 0), hum.MoveDirection * 3, settings)
-            if hit then hum.Jump = true end
-        end)
-        return "Autojump enabled."
-    end)
-    patch("unautojump", "guaranteed connection cleanup", function()
-        disconnect("autojump")
-        if HumanModCons then
-            for _, key in ipairs({"ajLoop", "ajCA"}) do
-                if HumanModCons[key] then pcall(function() HumanModCons[key]:Disconnect() end); HumanModCons[key] = nil end
-            end
-        end
-        return "Autojump disabled."
-    end)
-    patch("loopfullbright", "reduce 60Hz lighting mutations to a low-frequency loop", function()
-        RB.states.bright = (RB.states.bright or 0) + 1
-        local token = RB.states.bright
-        if brightLoop then pcall(function() brightLoop:Disconnect() end); brightLoop = nil end
-        task.spawn(function()
-            while RB.states.bright == token do
-                Lighting.Brightness = 2
-                Lighting.ClockTime = 14
-                Lighting.FogEnd = 100000
-                Lighting.GlobalShadows = false
-                Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
-                task.wait(0.35)
-            end
-        end)
-        return "Fullbright loop enabled (throttled)."
-    end)
-    patch("unloopfullbright", "cancel fullbright token", function()
-        RB.states.bright = (RB.states.bright or 0) + 1
-        if brightLoop then pcall(function() brightLoop:Disconnect() end); brightLoop = nil end
-        return "Fullbright loop disabled."
-    end)
-    patch("antivoid", "bounded void detection and no duplicate Stepped hook", function(args, player)
-        disconnect("antivoid")
-        if antivoidloop then pcall(function() antivoidloop:Disconnect() end) end
-        local lastSave = 0
-        antivoidloop = RunService.Stepped:Connect(function()
-            local hrp = root(player)
-            if not hrp or os.clock() - lastSave < 0.35 then return end
-            if hrp.Position.Y < workspace.FallenPartsDestroyHeight + 30 then
-                lastSave = os.clock()
-                hrp.AssemblyLinearVelocity = Vector3.new(
-                    hrp.AssemblyLinearVelocity.X,
-                    math.max(hrp.AssemblyLinearVelocity.Y, 150),
-                    hrp.AssemblyLinearVelocity.Z)
-            end
-        end)
-        RB.connections.antivoid = antivoidloop
-        if args[1] ~= "nonotify" then return "Anti-void enabled." end
-    end)
-    patch("unantivoid", "clean up anti-void loop", function(args)
-        disconnect("antivoid")
-        if antivoidloop then pcall(function() antivoidloop:Disconnect() end) end
-        antivoidloop = nil
-        if args[1] ~= "nonotify" then return "Anti-void disabled." end
-    end)
-    patch("teleportwalk", "valid speed and one Heartbeat loop", function(args, player)
-        disconnect("teleportwalk")
-        if tpwalking then pcall(function() tpwalking:Disconnect() end) end
-        local amount, err = finite(args[1], 1, 0, 200, "Teleport-walk speed")
-        if not amount then return err end
-        local hum = human(player)
-        if not hum then return "Humanoid unavailable." end
-        local additive = parseBoolean(args[2], false)
-        if additive then tpwalkStack = math.clamp((tpwalkStack or 0) + amount, 0, 200)
-        else tpwalkStack = 0 end
-        tpwalking = RunService.Heartbeat:Connect(function(dt)
-            local humanNow = human(player)
-            local part = root(player)
-            if not humanNow or not part or humanNow.Health <= 0 then return end
-            if humanNow.MoveDirection.Magnitude < 0.01 then return end
-            local distance = (amount + (tpwalkStack or 0)) * math.clamp(dt, 0, 0.06)
-            part.CFrame = part.CFrame + humanNow.MoveDirection * distance
-        end)
-        RB.connections.teleportwalk = tpwalking
-        return "Teleport walk enabled."
-    end)
-    patch("unteleportwalk", "nil-safe teleport-walk stop", function()
-        disconnect("teleportwalk")
-        if tpwalking then pcall(function() tpwalking:Disconnect() end) end
-        tpwalking = nil
-        tpwalkStack = 0
-        return "Teleport walk disabled."
-    end)
-
-    -- BUGFIX 04: correct precedence in selective interaction queries. Avoid
-    -- accidentally calling an API on unrelated Instances with matching parents.
-    local function interactionObjects(class, args)
-        local results = {}
-        local needle = table.concat(args or {}, " "):lower()
-        for _, item in ipairs(workspace:GetDescendants()) do
-            if item:IsA(class) and (needle == "" or
-                item.Name:lower() == needle or
-                (item.Parent and item.Parent.Name:lower() == needle)) then
-                table.insert(results, item)
-                if #results >= 2000 then break end
-            end
-        end
-        return results
-    end
-    patch("fireclickdetectors", "filter only actual ClickDetectors", function(args)
-        if type(fireclickdetector) ~= "function" then return "fireclickdetector is unavailable." end
-        local matched, fired = interactionObjects("ClickDetector", args), 0
-        for _, part in ipairs(matched) do
-            if part.Parent and pcall(fireclickdetector, part) then fired = fired + 1 end
-            if fired % 30 == 0 then task.wait() end
-        end
-        return "Click detectors triggered: " .. fired .. " / " .. #matched
-    end)
-    patch("fireproximityprompts", "filter only ProximityPrompts and guard failures", function(args)
-        if type(fireproximityprompt) ~= "function" then return "fireproximityprompt is unavailable." end
-        local matched, fired = interactionObjects("ProximityPrompt", args), 0
-        for _, item in ipairs(matched) do
-            if item.Parent and pcall(fireproximityprompt, item) then fired = fired + 1 end
-            if fired % 30 == 0 then task.wait() end
-        end
-        return "Proximity prompts triggered: " .. fired .. " / " .. #matched
-    end)
-    patch("touchinterests", "correct touch sender and protect nil parents", function(args, player)
-        if type(firetouchinterest) ~= "function" then return "firetouchinterest is unavailable." end
-        local hrp = root(player)
-        if not hrp then return "Character root unavailable." end
-        local objs = interactionObjects("TouchTransmitter", args)
-        local count = 0
-        for _, touch in ipairs(objs) do
-            local part = touch.Parent
-            if part and part:IsA("BasePart") then
-                local ok = pcall(function()
-                    firetouchinterest(hrp, part, 0)
-                    firetouchinterest(hrp, part, 1)
-                end)
-                if ok then count = count + 1 end
-                if count % 35 == 0 then task.wait() end
-            end
-        end
-        return "Touch transmitters processed: " .. count .. " / " .. #objs
-    end)
-    patch("instantproximityprompts", "single active prompt listener", function()
-        disconnect("instantprompts")
-        if PromptButtonHoldBegan then pcall(function() PromptButtonHoldBegan:Disconnect() end) end
-        if type(fireproximityprompt) ~= "function" then return "fireproximityprompt is unavailable." end
-        PromptButtonHoldBegan = ProximityPromptService.PromptButtonHoldBegan:Connect(function(item)
-            if item and item.Parent then pcall(fireproximityprompt, item) end
-        end)
-        RB.connections.instantprompts = PromptButtonHoldBegan
-        return "Instant prompts enabled."
-    end)
-    patch("uninstantproximityprompts", "disconnect instant prompt handler", function()
-        disconnect("instantprompts")
-        if PromptButtonHoldBegan then pcall(function() PromptButtonHoldBegan:Disconnect() end) end
-        PromptButtonHoldBegan = nil
-        return "Instant prompts disabled."
-    end)
-
-    -- BUGFIX 05: choose exactly one nearest matching target. The original
-    -- implementation teleports through *every* same-named part/model.
-    local function findNearest(class, query, player)
-        query = tostring(query or ""):lower()
-        if query == "" then return nil end
-        local origin = root(player)
-        if not origin then return nil end
-        local chosen, best = nil, math.huge
-        for _, item in ipairs(workspace:GetDescendants()) do
-            if item:IsA(class) and item.Name:lower() == query then
-                local point = item:IsA("BasePart") and item.Position or item:GetPivot().Position
-                local distance = (point - origin.Position).Magnitude
-                if distance < best then best, chosen = distance, item end
-            end
-        end
-        return chosen
-    end
-    local function moveToNamed(class, args, player)
-        local query = table.concat(args or {}, " ")
-        if query == "" then return "Provide an object name." end
-        local part = findNearest(class, query, player)
-        if not part then return "No matching " .. class .. " named '" .. query .. "'." end
-        local hrp = root(player)
-        if not hrp then return "Character root unavailable." end
-        local cf = part:IsA("BasePart") and part.CFrame or part:GetPivot()
-        local hum = human(player)
-        if hum and hum.SeatPart then hum.Sit = false; task.wait(0.1) end
-        hrp.CFrame = cf + Vector3.new(0, 3, 0)
-        return "Moved to " .. part:GetFullName()
-    end
-    patch("gotopart", "nearest match, nil safety, no repeated teleports", function(args, player)
-        return moveToNamed("BasePart", args, player)
-    end)
-    patch("gotomodel", "nearest model, Pivot APIs, nil safety", function(args, player)
-        return moveToNamed("Model", args, player)
-    end)
-    patch("mouseteleport", "correct CFrame construction and preserve orientation", function(args, player)
-        local hrp = root(player)
-        if not hrp then return "Character root unavailable." end
-        local hit = IYMouse and IYMouse.Hit
-        if not hit then return "Mouse is not targeting a point." end
-        hrp.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3, 0)) * hrp.CFrame.Rotation
-        return "Teleported to cursor."
-    end)
-    patch("notools", "nil-safe inventory deletion", function(args, player)
-        local removed = 0
-        local function clean(container)
-            if not container then return end
-            for _, item in ipairs(container:GetDescendants()) do
-                if item:IsA("Tool") or item:IsA("HopperBin") then
-                    item:Destroy()
-                    removed = removed + 1
-                end
-            end
-        end
-        clean(player and player:FindFirstChildOfClass("Backpack"))
-        clean(player and player.Character)
-        return "Removed " .. removed .. " tools."
-    end)
-    patch("antifling", "0.2-second selective monitoring and collision restoration", function(args, player)
-        disconnect("antifling")
-        if antifling then pcall(function() antifling:Disconnect() end) end
-        RB.states.antiFlingParts = RB.states.antiFlingParts or setmetatable({}, {__mode = "k"})
-        local elapsed = 0
-        antifling = RunService.Heartbeat:Connect(function(dt)
-            elapsed = elapsed + dt
-            if elapsed < 0.20 then return end
-            elapsed = 0
-            local myRoot = root(player)
-            if not myRoot then return end
-            for _, other in ipairs(Players:GetPlayers()) do
-                if other ~= player and other.Character then
-                    local otherRoot = root(other)
-                    if otherRoot and (otherRoot.Position - myRoot.Position).Magnitude < 50
-                        and otherRoot.AssemblyLinearVelocity.Magnitude > 85 then
-                        for _, part in ipairs(other.Character:GetDescendants()) do
-                            if part:IsA("BasePart") and part.CanCollide then
-                                RB.states.antiFlingParts[part] = true
-                                part.CanCollide = false
-                            end
-                        end
-                    end
-                end
-            end
-        end)
-        RB.connections.antifling = antifling
-        return "Anti-fling enabled (adaptive scan)."
-    end)
-    patch("unantifling", "restore changed collisions and disconnect", function()
-        disconnect("antifling")
-        if antifling then pcall(function() antifling:Disconnect() end) end
-        antifling = nil
-        for part in pairs(RB.states.antiFlingParts or {}) do
-            if part.Parent then pcall(function() part.CanCollide = true end) end
-        end
-        RB.states.antiFlingParts = nil
-        return "Anti-fling disabled."
-    end)
-
-    -- BUGFIX 06: history and auto-click tasks used to fail on empty input or
-    -- duplicate executor callbacks.  Both are now explicitly cancellable.
-    patch("lastcommand", "empty-history guard and recursion prevention", function()
-        local last = cmdHistory and cmdHistory[1]
-        if type(last) ~= "string" or last == "" then return "No previously executed command." end
-        local name = last:match("^%s*(%S+)")
-        if name == "lastcommand" or name == "lastcmd" then return "Cannot repeat lastcommand recursively." end
-        execCmd(last, me, false)
-        return "Repeated previous command."
-    end)
-    patch("notifyping", "nil-safe one-way and round-trip latency reporting", function(args, player)
-        local ok, value = pcall(function() return (player or me):GetNetworkPing() end)
-        if not ok or type(value) ~= "number" then return "Ping data unavailable." end
-        return string.format("Network latency: %.0f ms one-way (about %.0f ms round trip)", value * 1000, value * 2000)
-    end)
-    patch("autoclick", "bounded auto-click delay and single active task", function(args)
-        if type(mouse1press) ~= "function" or type(mouse1release) ~= "function" then
-            return "Click simulation API unavailable."
-        end
-        local delayClick, err = finite(args[1], 0.10, 0.03, 5, "Click interval")
-        if not delayClick then return err end
-        local delayRelease, err2 = finite(args[2], 0.05, 0.03, 5, "Release interval")
-        if not delayRelease then return err2 end
-        RB.states.autoClickToken = (RB.states.autoClickToken or 0) + 1
-        local token = RB.states.autoClickToken
-        autoclicking = true
-        disconnect("autoclickHotkey")
-        RB.connections.autoclickHotkey = UserInputService.InputBegan:Connect(function(input, processed)
-            if processed then return end
-            local key = input.KeyCode
-            if (key == Enum.KeyCode.Backspace and UserInputService:IsKeyDown(Enum.KeyCode.Equals))
-                or (key == Enum.KeyCode.Equals and UserInputService:IsKeyDown(Enum.KeyCode.Backspace)) then
-                RB.states.autoClickToken = RB.states.autoClickToken + 1
-                autoclicking = false
-                disconnect("autoclickHotkey")
-            end
-        end)
-        task.spawn(function()
-            while autoclicking and RB.states.autoClickToken == token do
-                local ok = pcall(mouse1press)
-                task.wait(delayRelease)
-                pcall(mouse1release)
-                if not ok then
-                    autoclicking = false
-                    RB.states.autoClickToken = RB.states.autoClickToken + 1
-                    break
-                end
-                task.wait(delayClick)
-            end
-        end)
-        return "Autoclick enabled; use unautoclick to stop."
-    end)
-    patch("unautoclick", "stop clicks and restore released mouse state", function()
-        RB.states.autoClickToken = (RB.states.autoClickToken or 0) + 1
-        autoclicking = false
-        disconnect("autoclickHotkey")
-        if cancelAutoClick then pcall(function() cancelAutoClick:Disconnect() end); cancelAutoClick = nil end
-        if type(mouse1release) == "function" then pcall(mouse1release) end
-        return "Autoclick disabled."
-    end)
-    patch("fullbright", "consistent lighting preset", function()
-        Lighting.Brightness = 2
-        Lighting.ClockTime = 14
-        Lighting.FogEnd = 100000
-        Lighting.GlobalShadows = false
-        Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
-        return "Fullbright applied."
-    end)
-    patch("freezeunanchored", "avoid anchoring character parts and keep undo state", function()
-        RB.states.frozenParts = RB.states.frozenParts or setmetatable({}, {__mode = "k"})
-        local total, scanned = 0, 0
-        for _, item in ipairs(workspace:GetDescendants()) do
-            scanned = scanned + 1
-            if item:IsA("BasePart") and not item.Anchored
-                and not (me.Character and item:IsDescendantOf(me.Character)) then
-                if RB.states.frozenParts[item] == nil then
-                    RB.states.frozenParts[item] = false
-                    item.Anchored = true
-                    total = total + 1
-                end
-            end
-            if scanned % 250 == 0 then task.wait() end
-        end
-        return "Anchored " .. total .. " previously unanchored parts (local)."
-    end)
-    patch("thawunanchored", "restore only parts changed by freezeunanchored", function()
-        local total = 0
-        for item, previous in pairs(RB.states.frozenParts or {}) do
-            if item.Parent and item:IsA("BasePart") then
-                item.Anchored = previous
-                total = total + 1
-            end
-        end
-        RB.states.frozenParts = nil
-        return "Restored " .. total .. " anchored parts."
-    end)
-
-    -- Every registered command, including the original 430+ and all prior NOVA
-    -- additions, is wrapped with its OWN metrics, diagnostics and safe dispatch.
-    -- The underlying command implementation is retained unless explicitly
-    -- replaced above; wrapping is not a claim that all underlying logic is rewritten.
-    function RB.wrap(command)
-        if type(command) ~= "table" then return false end
-        if type(command.NAME) ~= "string" or type(command.FUNC) ~= "function" then
-            log("registry", "Invalid command registration")
-            return false
-        end
-        if RB.wrapped[command] and RB.wrapped[command] == command.FUNC then return true end
-        local old = command.FUNC
-        local name = command.NAME:lower()
-        local stat = RB.commands[name]
-        if not stat then
-            stat = {calls = 0, failures = 0, totalMs = 0, worstMs = 0, lastError = "", lastRun = 0}
-            RB.commands[name] = stat
-        end
-        local wrapped = function(args, speaker)
-            args = type(args) == "table" and args or {}
-            speaker = speaker or me
-            local started = os.clock()
-            local okay, result = pcall(old, args, speaker)
-            local duration = math.max(0, (os.clock() - started) * 1000)
-            stat.calls = stat.calls + 1
-            stat.totalMs = stat.totalMs + duration
-            stat.worstMs = math.max(stat.worstMs, duration)
-            stat.lastRun = os.time()
-            if not okay then
-                stat.failures = stat.failures + 1
-                stat.lastError = tostring(result):sub(1, 400)
-                log(name, result)
-                -- Do not turn exceptions into apparent successes. The dispatcher
-                -- catches this and stops repeated commands after three failures.
-                error("[NOVA:" .. name .. "] " .. tostring(result), 0)
-            end
-            return result
-        end
-        command.FUNC = wrapped
-        RB.wrapped[command] = wrapped
-        RB.auditCount = RB.auditCount + 1
-        return true
-    end
-    function RB.audit()
-        local found = {}
-        local issues = {}
-        local count, inspected = 0, 0
-        for _, command in ipairs(cmds) do
-            local name = tostring(command.NAME or ""):lower()
-            if name == "" or type(command.FUNC) ~= "function" then
-                table.insert(issues, "Invalid registration at " .. tostring(count + 1))
-            else
-                inspected = inspected + 1
-                if found[name] then table.insert(issues, "Duplicate name: " .. name) end
-                found[name] = name
-                RB.wrap(command)
-            end
-            count = count + 1
-        end
-        local aliasOwners = {}
-        for _, command in ipairs(cmds) do
-            for _, alias in ipairs(type(command.ALIAS) == "table" and command.ALIAS or {}) do
-                alias = tostring(alias):lower()
-                if aliasOwners[alias] and aliasOwners[alias] ~= command.NAME then
-                    table.insert(issues, "Alias conflict: " .. alias)
-                end
-                aliasOwners[alias] = command.NAME
-            end
-        end
-        RB.lastAudit = {total = count, checked = inspected, issues = issues, patched = RB.patchCount}
-        return RB.lastAudit
-    end
-    _G.IY_NOVA_REBUILD_HOOK = function(command)
-        if RB and RB.wrap then RB.wrap(command) end
-    end
-
-    local function register(name, aliases, usage, description, func)
-        if findCmd(name) then return end
-        addcmd(name, aliases or {}, func)
-        addcmdtext(usage or name, "NOVA REBUILD", description)
-    end
-    register("nvaudit", {"nvcmdcheck"}, "nvaudit", "Check all registered command records and alias conflicts.", function()
-        local result = RB.audit()
-        return string.format("Checked %d/%d commands; %d individual corrections; %d registry warnings. Use nvissues to inspect.",
-            result.checked, result.total, RB.patchCount, #result.issues)
-    end)
-    register("nvissues", {"nvconflicts"}, "nvissues", "Show any registry or alias conflicts.", function()
-        local result = RB.audit()
-        if #result.issues == 0 then return "No duplicate names or alias conflicts found." end
-        notify("NOVA / Registry Warnings", table.concat(result.issues, "\n"):sub(1, 900), 15)
-    end)
-    register("nverrors", {"nvfailures"}, "nverrors", "Show command errors recorded by the universal wrapper.", function()
-        if #RB.logs == 0 then return "No captured command failures." end
-        local lines = {}
-        for i = 1, math.min(6, #RB.logs) do
-            table.insert(lines, RB.logs[i].name .. ": " .. RB.logs[i].error:sub(1, 86))
-        end
-        notify("NOVA / Recent Failures", table.concat(lines, "\n"), 16)
-    end)
-    register("nvprofile", {"nvcmdprofile"}, "nvprofile [command]", "Show execution timing and failures for a command.", function(args)
-        local name = tostring(args[1] or ""):lower()
-        if name == "" then
-            local top = {}
-            for n, stat in pairs(RB.commands) do if stat.calls > 0 then table.insert(top, {name = n, stat = stat}) end end
-            table.sort(top, function(a, b) return a.stat.totalMs > b.stat.totalMs end)
-            local lines = {}
-            for i = 1, math.min(#top, 6) do
-                table.insert(lines, string.format("%s  %.1fms in %d calls", top[i].name, top[i].stat.totalMs, top[i].stat.calls))
-            end
-            if #lines == 0 then return "No command calls have been profiled yet." end
-            notify("NOVA / Heavy Commands", table.concat(lines, "\n"), 16)
-            return
-        end
-        local cmd = findCmd(name)
-        if not cmd then return "Unknown command: " .. name end
-        local stat = RB.commands[cmd.NAME:lower()]
-        if not stat then return "No profile recorded yet." end
-        return string.format("%s: %d runs, %d errors, avg %.2f ms, max %.2f ms", cmd.NAME,
-            stat.calls, stat.failures, stat.calls > 0 and stat.totalMs / stat.calls or 0, stat.worstMs)
-    end)
-    register("nvpatches", {"nvfixes"}, "nvpatches", "List rewritten commands and fixes in this release.", function()
-        local names = {}
-        for name in pairs(RB.patches) do table.insert(names, name) end
-        table.sort(names)
-        notify("NOVA / Rewritten Commands (" .. #names .. ")", table.concat(names, ", "):sub(1, 1300), 16)
-    end)
-    register("nvrestore", {"nvstopmanaged"}, "nvrestore", "Stop managed loops, restore collision settings and reset listeners.", function()
-        for name in pairs(RB.connections) do disconnect(name) end
-        stopNoclip()
-        RB.states.bright = (RB.states.bright or 0) + 1
-        RB.states.autoClickToken = (RB.states.autoClickToken or 0) + 1
-        autoclicking = false
-        if type(mouse1release) == "function" then pcall(mouse1release) end
-        for part in pairs(RB.states.antiFlingParts or {}) do
-            if part.Parent then pcall(function() part.CanCollide = true end) end
-        end
-        RB.states.antiFlingParts = nil
-        if antivoidloop then pcall(function() antivoidloop:Disconnect() end); antivoidloop = nil end
-        if tpwalking then pcall(function() tpwalking:Disconnect() end); tpwalking = nil end
-        if infJump then pcall(function() infJump:Disconnect() end); infJump = nil end
-        if Noclipping then pcall(function() Noclipping:Disconnect() end); Noclipping = nil end
-        Clip = true
-        return "Managed command features stopped and collision state restored."
-    end)
-    register("nvstatus", {"nvhealth"}, "nvstatus", "Summarize command registry, instrumentation, patch count and failures.", function()
-        local report = RB.audit()
-        return string.format("NOVA Rebuild %s | %d commands | %d rewritten | %d wrapper records | %d failures | %d warnings",
-            RB.version, report.total, RB.patchCount, report.checked, #RB.logs, #report.issues)
-    end)
-    RB.audit()
-    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
-    if _G.IY_DEBUG then print("[NOVA Rebuild] All", RB.auditCount, "commands wrapped;", RB.patchCount, "individually repaired") end
-end
-
-
---[[
-  NOVA HELIX | 2026-11-20
-  Reliability commands, bounded recipes and progression metrics.
-  Compatible with old IY/NOVA names. No automatic purchases or server spoofing.
-]]
-do
-    local H = {version = "4.0.0", recipes = {}, recipeToken = 0, activeRecipe = nil,
-        metrics = nil, metricSince = nil, metricFilter = nil, registered = 0}
-    _G.IY_NOVA_HELIX = H
-    local me = Players.LocalPlayer
-    local recipePath = "IY_NOVA_RECIPES.iy"
-    local function register(name, aliases, usage, details, handler)
-        if findCmd(name) then return false end
-        addcmd(name, aliases, handler)
-        addcmdtext(usage, "NOVA HELIX", details)
-        H.registered = H.registered + 1
-        return true
-    end
-    local function statusText()
-        local d = _G.IY_NOVA_DISPATCH
-        local rb = _G.IY_NOVA_REBUILD
-        local loopCount = d and d.loopCount and d.loopCount() or 0
-        local last = rb and rb.lastAudit or {}
-        return string.format("HELIX %s | %d registered | workers %d/%d | loops %d | command calls %d | errors %d | registry warnings %d",
-            H.version, #cmds, d and d.active or 0, d and d.maxActive or 0,
-            loopCount, d and d.executed or 0, d and d.failures or 0,
-            #(last.issues or {}))
-    end
-    register("novahealth", {"nhealth"}, "novahealth", "Show active workers, loops, error counts and registry health.", function()
-        return statusText()
-    end)
-    register("novaloops", {"nloops"}, "novaloops", "List currently running infinite command tasks.", function()
-        local d = _G.IY_NOVA_DISPATCH
-        local lines = {}
-        for name, detail in pairs(d.infinite) do
-            lines[#lines + 1] = string.format("%s  (%d runs, %.2fs delay)", name, detail.count or 0, detail.interval or 0)
-        end
-        table.sort(lines)
-        if #lines == 0 then return "No infinite command tasks are running." end
-        notify("NOVA / ACTIVE COMMAND LOOPS", table.concat(lines, "\n"):sub(1, 1300), 14)
-    end)
-    register("novastoploop", {"nstoploop"}, "novastoploop [name/all]", "Stop one infinite command or all repeating command tasks.", function(args)
-        local target = tostring(args[1] or ""):lower()
-        if target == "" then return "Usage: novastoploop [command/all]" end
-        local d = _G.IY_NOVA_DISPATCH
-        if target == "all" then
-            local count = d.stopAll()
-            return "Stopped " .. count .. " repeating tasks and cancelled active command batches."
-        end
-        return d.stopLoop(target) and ("Stopped repeating " .. target .. ".")
-            or ("No running repeating task for " .. target .. ".")
-    end)
-    register("novaworkers", {"nworkers"}, "novaworkers [2-16]", "Limit simultaneous command batches to prevent executor overload.", function(args)
-        local d = _G.IY_NOVA_DISPATCH
-        if not args[1] then return string.format("Worker limit: %d | Active: %d", d.maxActive, d.active) end
-        local n = tonumber(args[1])
-        if not n or n ~= n or n == math.huge or n == -math.huge then return "Usage: novaworkers [2-16]" end
-        d.maxActive = math.clamp(math.floor(n), 2, 16)
-        return "Maximum simultaneous command batches: " .. d.maxActive
-    end)
-    register("novasafestop", {"nstopall"}, "novasafestop", "Cancel managed loops, recipes and recently patched character mechanics.", function()
-        local d = _G.IY_NOVA_DISPATCH
-        local loops = d.stopAll()
-        H.recipeToken = H.recipeToken + 1
-        H.activeRecipe = nil
-        local stop = findCmd("nvrestore")
-        if stop then pcall(stop.FUNC, {}, me) end
-        return string.format("Stopped %d looping tasks, recipes, and managed movement effects.", loops)
-    end)
-
-    local function validRecipeName(raw)
-        if type(raw) ~= "string" or #raw == 0 or #raw > 24 then return nil end
-        if not raw:match("^[%w_%-]+$") then return nil end
-        return raw:lower()
-    end
-    local function recipeKeys()
-        local names = {}
-        for name in pairs(H.recipes) do names[#names + 1] = name end
-        table.sort(names)
-        return names
-    end
-    local function saveRecipes()
-        if type(waxwritefile) ~= "function" then return false end
-        local okay, encoded = pcall(function() return HttpService:JSONEncode({version=1, recipes=H.recipes}) end)
-        if not okay then return false end
-        return pcall(waxwritefile, recipePath, encoded)
-    end
-    if type(waxreadfile) == "function" then
-        local success, content = pcall(waxreadfile, recipePath)
-        if success and type(content) == "string" and #content < 32000 then
-            local valid, decoded = pcall(function() return HttpService:JSONDecode(content) end)
-            if valid and type(decoded) == "table" and type(decoded.recipes) == "table" then
-                local count = 0
-                for name, steps in pairs(decoded.recipes) do
-                    if count >= 20 then break end
-                    if validRecipeName(name) and type(steps) == "table" and #steps <= 8 then
-                        local cleaned = {}
-                        for _, step in ipairs(steps) do
-                            if type(step) == "string" and #step <= 180 then
-                                local first = step:match("^%s*([^%s]+)")
-                                if first and findCmd(first)
-                                    and first:lower() ~= "novarecipe" and first:lower() ~= "nrecipe" then
-                                    cleaned[#cleaned + 1] = step
-                                end
-                            end
-                        end
-                        if #cleaned > 0 then H.recipes[name:lower()] = cleaned; count = count + 1 end
-                    end
-                end
-            end
-        end
-    end
-    register("novarecipe", {"nrecipe"},
-        "novarecipe [save/list/show/run/delete/stop] ...",
-        "Save and replay up to eight validated commands. Separate steps with |.", function(args)
-        local operation = tostring(args[1] or "list"):lower()
-        if operation == "list" then
-            local names = recipeKeys()
-            return #names == 0 and "No recipes saved. Example: novarecipe save setup perfmon | novastatview"
-                or ("Recipes (" .. #names .. "): " .. table.concat(names, ", "))
-        end
-        if operation == "stop" then
-            H.recipeToken = H.recipeToken + 1
-            H.activeRecipe = nil
-            return "Recipe dispatch cancelled. Already-running commands may still finish."
-        end
-        local name = validRecipeName(args[2])
-        if not name then return "Usage: novarecipe [save/show/run/delete] [name] ..." end
-        if operation == "show" then
-            local steps = H.recipes[name]
-            return steps and (name .. ": " .. table.concat(steps, " | ")) or "Unknown recipe."
-        elseif operation == "delete" then
-            if not H.recipes[name] then return "Unknown recipe." end
-            H.recipes[name] = nil
-            saveRecipes()
-            return "Deleted recipe: " .. name
-        elseif operation == "save" then
-            if #recipeKeys() >= 20 and not H.recipes[name] then return "Maximum 20 recipes reached." end
-            local raw = table.concat(args, " ", 3)
-            if #raw > 1000 then return "Recipe is too long (limit 1000 characters)." end
-            local steps = {}
-            for text in (raw .. "|"):gmatch("(.-)|") do
-                local step = text:match("^%s*(.-)%s*$")
-                if step ~= "" then
-                    if #step > 180 or #steps >= 8 then return "A recipe may contain at most 8 steps (180 chars each)." end
-                    local first = step:match("^([^%s]+)")
-                    if not first or not findCmd(first) or first:lower() == "novarecipe"
-                        or first:lower() == "nrecipe" then
-                        return "Unknown or recursive step: " .. tostring(first)
-                    end
-                    steps[#steps + 1] = step
-                end
-            end
-            if #steps == 0 then return "Add commands separated by | after the recipe name." end
-            H.recipes[name] = steps
-            saveRecipes()
-            return string.format("Saved recipe %s with %d steps.", name, #steps)
-        elseif operation == "run" then
-            local steps = H.recipes[name]
-            if not steps then return "Unknown recipe." end
-            if H.activeRecipe then return "Another recipe is active; use novarecipe stop first." end
-            H.recipeToken = H.recipeToken + 1
-            local token = H.recipeToken
-            H.activeRecipe = name
-            task.spawn(function()
-                for _, step in ipairs(steps) do
-                    if token ~= H.recipeToken then break end
-                    execCmd(step, me, true)
-                    task.wait(0.45)
-                end
-                if token == H.recipeToken then H.activeRecipe = nil end
-            end)
-            return "Started recipe " .. name .. " (" .. #steps .. " steps)."
-        end
-        return "Usage: novarecipe [save/list/show/run/delete/stop]"
-    end)
-    register("novarecipestatus", {"nrecipestatus"}, "novarecipestatus", "Check recipe state and persistence.", function()
-        return string.format("Recipes: %d/20 | Running: %s | Persistence: %s", #recipeKeys(),
-            H.activeRecipe or "none", type(waxwritefile) == "function" and "available" or "session-only")
-    end)
-
-    local function getNumberValues()
-        local collected, visited = {}, 0
-        for _, obj in ipairs(me:GetDescendants()) do
-            visited = visited + 1
-            if visited > 1800 or #collected >= 80 then break end
-            if obj:IsA("NumberValue") or obj:IsA("IntValue") then
-                local value = tonumber(obj.Value)
-                if value and value == value and math.abs(value) ~= math.huge then
-                    collected[#collected + 1] = {ref=obj, name=obj.Name, value=value}
-                end
-            end
-        end
-        return collected
-    end
-    register("novametric", {"nmetric"}, "novametric [start/show/stop] [stat-filter]",
-        "Measure changes in client-visible numeric progression stats.", function(args)
-        local action = tostring(args[1] or "show"):lower()
-        if action == "stop" or action == "clear" then
-            H.metrics, H.metricSince, H.metricFilter = nil, nil, nil
-            return "Progress metric baseline cleared."
-        elseif action == "start" then
-            H.metrics = {}
-            H.metricFilter = table.concat(args, " ", 2):lower()
-            local items = getNumberValues()
-            for _, item in ipairs(items) do
-                if H.metricFilter == "" or item.name:lower():find(H.metricFilter, 1, true) then
-                    H.metrics[#H.metrics + 1] = item
-                end
-            end
-            H.metricSince = os.clock()
-            return string.format("Tracking %d numeric values (baseline captured).", #H.metrics)
-        elseif action == "show" then
-            if not H.metrics then return "No baseline. Use novametric start [optional stat name]." end
-            local elapsed = math.max(0.01, os.clock() - H.metricSince)
-            local changes = {}
-            for _, item in ipairs(H.metrics) do
-                if item.ref.Parent then
-                    local ok, current = pcall(function() return tonumber(item.ref.Value) end)
-                    if ok and current and current == current and math.abs(current) ~= math.huge then
-                        local delta = current - item.value
-                        if delta ~= 0 then
-                            changes[#changes + 1] = {name=item.name, delta=delta, rate=delta/elapsed}
-                        end
-                    end
-                end
-            end
-            table.sort(changes, function(a,b) return math.abs(a.delta) > math.abs(b.delta) end)
-            if #changes == 0 then return string.format("No numeric stat changes over %.1fs (%d tracked).", elapsed, #H.metrics) end
-            local lines = {}
-            for i = 1, math.min(6, #changes) do
-                local e = changes[i]
-                lines[#lines + 1] = string.format("%s  %+g  (%+.2f/s)", e.name, e.delta, e.rate)
-            end
-            notify("NOVA / PROGRESSION DELTAS", table.concat(lines, "\n"), 16)
-            return string.format("Observed %d changed stats over %.1fs.", #changes, elapsed)
-        end
-        return "Usage: novametric [start/show/stop] [optional name]"
-    end)
-    register("novaexporthealth", {"nexporthealth"}, "novaexporthealth", "Copy local command health diagnostics as JSON when clipboard is available.", function()
-        if type(everyClipboard) ~= "function" then return "Clipboard API not available." end
-        local d = _G.IY_NOVA_DISPATCH
-        local rb = _G.IY_NOVA_REBUILD
-        local payload = {version=H.version, commandCount=#cmds, activeWorkers=d.active,
-            maxWorkers=d.maxActive, activeLoops=d.loopCount(), calls=d.executed,
-            errors=d.failures, blocked=d.blocked, corrected=rb and rb.patchCount or 0,
-            recentErrors={}}
-        local records = _G.IY_NOVA_ERRORS or {}
-        for i=1, math.min(8,#records) do
-            payload.recentErrors[i] = {command=tostring(records[i].command or ""),
-                message=tostring(records[i].message or ""):sub(1,180)}
-        end
-        local ok, data = pcall(function() return HttpService:JSONEncode(payload) end)
-        if not ok then return "JSON diagnostics unavailable." end
-        local done = pcall(everyClipboard, data)
-        return done and "Copied diagnostics JSON locally; no network upload was performed."
-            or "Clipboard write failed."
-    end)
-    register("novahelixhelp", {"nhelix"}, "novahelixhelp", "Show reliability commands, recipes and stat tracking.", function()
-        notify("NOVA HELIX / COMMANDS",
-            "novahealth | novaloops | novastoploop [name/all] | novaworkers [2-16] | " ..
-            "novasafestop | novarecipe [save/list/show/run/delete/stop] | " ..
-            "novametric [start/show/stop] | novaquickbar [on/off] | novaexporthealth", 18)
-    end)
-    if _G.IY_NOVA_REBUILD and _G.IY_NOVA_REBUILD.audit then
-        pcall(_G.IY_NOVA_REBUILD.audit)
-    end
-    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
-    if type(IndexContents) == "function" then pcall(IndexContents, "", true) end
-    if _G.IY_DEBUG then print("[NOVA HELIX] Registered", H.registered, "additional commands") end
-end
-
-
---[[
- NOVA HELIX v4 | Recovery and Diagnostics
- No remote manipulation, bypass logic, or network telemetry.
- All actions run locally and preserve existing command names.
-]]
-do
-    local V4 = {version = "4.0.0", registered = 0, cleanupFailures = {},
-        startedAt = os.clock(), snapshots = nil}
-    _G.IY_NOVA_HELIX_V4 = V4
-    local me = Players.LocalPlayer
-    local function reg(name, aliases, desc, handler)
-        if findCmd(name) then return false end
-        local command = addcmd(name, aliases, handler)
-        if command and command.NAME == name then
-            addcmdtext(name, "NOVA HELIX V4", desc)
-            V4.registered = V4.registered + 1
-            return true
-        end
-        return false
-    end
-    local function invokeExisting(name)
-        local command = findCmd(name)
-        if not command then return false, "missing" end
-        local ok, result = pcall(command.FUNC, {}, me)
-        return ok, result
-    end
-    local function stopEverything()
-        local d = _G.IY_NOVA_DISPATCH
-        local loops = d and d.stopAll and d.stopAll() or 0
-        local helix = _G.IY_NOVA_HELIX
-        if helix then
-            helix.recipeToken = helix.recipeToken + 1
-            helix.activeRecipe = nil
-        end
-        local stopped, failed = 0, {}
-        -- Every module keeps its own reversible teardown; use those APIs.
-        local cleanup = {
-            "progshutdown", "cheatshutdown", "novastopall", "nvrestore",
-            "unmultijump", "unbunnyhop", "unglide", "unwallclimb",
-            "unsprint", "untracers", "unradar", "undistancetags",
-            "untoolesp", "unaimassist", "unperfmon"
-        }
-        for _, command in ipairs(cleanup) do
-            if findCmd(command) then
-                local ok, err = invokeExisting(command)
-                if ok then stopped = stopped + 1
-                else failed[#failed + 1] = command .. ": " .. tostring(err):sub(1, 80) end
-            end
-        end
-        V4.cleanupFailures = failed
-        local msg = string.format("Cancelled %d repeating tasks; ran %d cleanup handlers.", loops, stopped)
-        if #failed > 0 then
-            msg = msg .. " Failed: " .. table.concat(failed, ", "):sub(1, 220)
-        end
-        return msg
-    end
-    -- Keep previous stop command name, but extend its scope to all NOVA packs.
-    overridecmd("novasafestop", function() return stopEverything() end)
-    reg("novapanic", {"novaemergency", "nresetall"},
-        "Stop managed gameplay, progression, navigation, overlays and repeat tasks.",
-        function() return stopEverything() end)
-
-    reg("novabudget", {"nbudget"},
-        "Get or set the maximum number of command calls in one dispatch batch.",
-        function(args)
-            local d = _G.IY_NOVA_DISPATCH
-            if not args[1] then return "Command batch budget: " .. tostring(d.maxBatchCalls) end
-            local n = tonumber(args[1])
-            if not n or n ~= n or n == math.huge or n == -math.huge
-                or n ~= math.floor(n) or n < 50 or n > 4000 then
-                return "Usage: novabudget [integer 50-4000]"
-            end
-            d.maxBatchCalls = n
-            return "Per-batch command limit set to " .. n
-        end)
-
-    reg("novaauditlive", {"nauditlive", "novaverify"},
-        "Inspect registered commands, aliases, callbacks, API availability and worker state.",
-        function()
-            local seen, conflicts = {}, {}
-            local missingCallbacks, registered = 0, 0
-            for _, command in ipairs(cmds) do
-                registered = registered + 1
-                if type(command.FUNC) ~= "function" then missingCallbacks = missingCallbacks + 1 end
-                local names = {command.NAME}
-                for _, alias in ipairs(command.ALIAS or {}) do names[#names + 1] = alias end
-                for _, name in ipairs(names) do
-                    local key = tostring(name):lower()
-                    if seen[key] and #conflicts < 8 then
-                        conflicts[#conflicts + 1] = key
-                    else
-                        seen[key] = true
-                    end
-                end
-            end
-            local d = _G.IY_NOVA_DISPATCH
-            local detail = string.format(
-                "Commands: %d | missing callbacks: %d | duplicate names/aliases (sample): %d | workers: %d/%d | loop count: %d | cancelled by budget: %d | clipboard: %s | settings files: %s",
-                registered, missingCallbacks, #conflicts,
-                d and d.active or 0, d and d.maxActive or 0,
-                d and d.loopCount and d.loopCount() or 0,
-                d and d.budgetStops or 0,
-                type(everyClipboard) == "function" and "yes" or "no",
-                type(waxreadfile) == "function" and type(waxwritefile) == "function" and "yes" or "no")
-            if #conflicts > 0 then detail = detail .. "\nConflicts: " .. table.concat(conflicts, ", ") end
-            notify("NOVA HELIX / LIVE AUDIT", detail, 15)
-            return detail
-        end)
-
-    reg("novacmdinspect", {"ncmdinspect"},
-        "Inspect a command's aliases, source group and usage without executing it.",
-        function(args)
-            local raw = args[1]
-            if not raw or raw == "" then return "Usage: novacmdinspect [command name]" end
-            local command = findCmd(raw)
-            if not command then return "Unknown command: " .. tostring(raw) end
-            local group = "Unknown"
-            local ui = _G.IY_NOVA_UI
-            if ui and type(ui.category) == "function" then
-                local ok, value = pcall(ui.category, command.NAME)
-                if ok then group = tostring(value) end
-            end
-            local aliases = table.concat(command.ALIAS or {}, ", ")
-            local detail = string.format("%s | %s | Aliases: %s | Callback: %s",
-                tostring(command.NAME), group, aliases ~= "" and aliases or "none",
-                type(command.FUNC))
-            notify("NOVA / COMMAND DETAILS", detail, 12)
-            return detail
-        end)
-
-    local function getBody()
-        local character = me.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        return humanoid
-    end
-    reg("novaphysics", {"nphysics"},
-        "Save or restore local movement and camera properties (does not alter server stats).",
-        function(args)
-            local action = tostring(args[1] or "status"):lower()
-            local hum = getBody()
-            local camera = workspace.CurrentCamera
-            if action == "save" then
-                if not hum then return "Character is not ready." end
-                V4.snapshots = {humanoid = hum,
-                    walkSpeed = hum.WalkSpeed, useJumpPower = hum.UseJumpPower,
-                    jumpPower = hum.JumpPower, jumpHeight = hum.JumpHeight,
-                    hipHeight = hum.HipHeight, gravity = workspace.Gravity,
-                    camera = camera, fov = camera and camera.FieldOfView or nil}
-                return "Saved local movement, gravity and camera FOV snapshot."
-            elseif action == "restore" then
-                local snap = V4.snapshots
-                if not snap then return "No snapshot. Use novaphysics save first." end
-                if hum and hum == snap.humanoid then
-                    pcall(function()
-                        hum.WalkSpeed = snap.walkSpeed
-                        hum.UseJumpPower = snap.useJumpPower
-                        hum.JumpPower = snap.jumpPower
-                        hum.JumpHeight = snap.jumpHeight
-                        hum.HipHeight = snap.hipHeight
-                    end)
-                end
-                workspace.Gravity = snap.gravity
-                if camera and camera == snap.camera and snap.fov then
-                    pcall(function() camera.FieldOfView = snap.fov end)
-                end
-                return "Restored snapshot for objects still present. Stop active movement commands first."
-            elseif action == "clear" then
-                V4.snapshots = nil
-                return "Local physics snapshot cleared."
-            end
-            return "Snapshot: " .. (V4.snapshots and "saved" or "none") .. " | novaphysics [save/restore/clear]"
-        end)
-
-    reg("novav4help", {"nhelix4"},
-        "Display this release's diagnostics and recovery commands.",
-        function()
-            return "HELIX v4: novapanic, novabudget, novaauditlive, novacmdinspect, novaphysics. Use F2 or Ctrl+K to open the organized palette."
-        end)
-    if _G.IY_NOVA_UI and _G.IY_NOVA_UI.refresh then pcall(_G.IY_NOVA_UI.refresh) end
-    if type(IndexContents) == "function" then pcall(IndexContents, "", true) end
-end
