@@ -94,8 +94,12 @@ CaptureService = Services.CaptureService
 VoiceChatService = Services.VoiceChatService
 SocialService = Services.SocialService
 
-PlayerGui = cloneref(Players.LocalPlayer:FindFirstChildWhichIsA("PlayerGui"))
-COREGUI = Services.CoreGui or PlayerGui
+-- Wait for PlayerGui and make the CoreGui fallback usable even when CoreGui access fails.
+PlayerGui = cloneref(Players.LocalPlayer:WaitForChild("PlayerGui"))
+local coreGuiAvailable, coreGuiInstance = pcall(function()
+    return Services.CoreGui
+end)
+COREGUI = (coreGuiAvailable and coreGuiInstance) or PlayerGui
 IYMouse = cloneref(Players.LocalPlayer:GetMouse())
 PlaceId, JobId = game.PlaceId, game.JobId
 xpcall(function()
@@ -1979,6 +1983,88 @@ function create(data)
 	return insts[1]
 end
 
+-- IY_WRITE_QUEUE_MODULE_BEGIN
+-- Coalesced serialized writes with bounded retries and injectable clock/scheduler.
+-- No Roblox dependencies: test with a deterministic fake scheduler.
+local IYWriteQueue = {}
+
+function IYWriteQueue.New(options)
+    assert(type(options) == "table", "write queue options required")
+    assert(type(options.write) == "function" and type(options.spawn) == "function", "write and spawn required")
+    assert(type(options.wait) == "function" and type(options.now) == "function", "wait and now required")
+    local active = {}
+    local debounce = options.debounce or 0.4
+    local maxAttempts = options.maxAttempts or 3
+    local minRetry = options.minRetry or 0.2
+    local report = options.report or function() end
+    local closed = false
+    local self = {}
+
+    local function worker(name, item)
+        while not closed and active[name] == item do
+            local remaining = debounce - (options.now() - item.updated)
+            if remaining > 0 then
+                options.wait(remaining)
+            else
+                local version = item.version
+                local data = item.data
+                -- Treat a writer returning false as failure as well as a thrown error.
+                local protected, result, detail = pcall(options.write, name, data)
+                local good = protected and result ~= false
+                if good then
+                    item.failures = 0
+                    if item.version == version then
+                        active[name] = nil
+                        return
+                    end
+                else
+                    item.failures = item.failures + 1
+                    report(name, protected and (detail or "write returned false") or result, item.failures)
+                    if item.failures >= maxAttempts then
+                        -- A newer revision must still get its own attempts.
+                        if item.version == version then
+                            active[name] = nil
+                            return
+                        end
+                        item.failures = 0
+                    else
+                        options.wait(minRetry * 2 ^ (item.failures - 1))
+                    end
+                end
+            end
+        end
+    end
+
+    function self:Submit(name, data)
+        if closed or type(name) ~= "string" or name == "" or type(data) ~= "string" then
+            return false
+        end
+        local item = active[name]
+        if item then
+            item.data = data
+            item.updated = options.now()
+            item.version = item.version + 1
+        else
+            item = {data = data, updated = options.now(), version = 1, failures = 0}
+            active[name] = item
+            options.spawn(function() worker(name, item) end)
+        end
+        return true
+    end
+
+    function self:Stop()
+        closed = true
+        for name in pairs(active) do active[name] = nil end
+    end
+
+    function self:PendingCount()
+        local n = 0
+        for _ in pairs(active) do n = n + 1 end
+        return n
+    end
+    return self
+end
+-- IY_WRITE_QUEUE_MODULE_END
 ViewportTextBox = (function()
 
 	local funcs = {}
@@ -2189,13 +2275,23 @@ end
 
 AllWaypoints = {}
 
--- Lightweight save helper for Infinite Yield settings and logs.
+-- Shared persistence queue; one writer per filename and bounded failure retries.
+local iyWriteQueue = IYWriteQueue.New({
+    now = os.clock,
+    spawn = task.spawn,
+    wait = task.wait,
+    write = function(name, contents)
+        if type(writefile) ~= "function" then return false, "writefile unavailable" end
+        return writefile(name, contents)
+    end,
+    report = function(name, reason, attempt)
+        warn("[Infinite Yield] Save failed (attempt " .. tostring(attempt) .. ") " .. name .. ": " .. tostring(reason))
+    end,
+    debounce = 0.4,
+    maxAttempts = 3,
+})
 function writefileCooldown(name, data)
-    if type(writefile) ~= "function" then return end
-    task.spawn(function()
-        task.wait(0.4)
-        pcall(writefile, name, data)
-    end)
+    return iyWriteQueue:Submit(name, data)
 end
 
 function dragGUI(gui)
@@ -2261,7 +2357,7 @@ eventEditor = (function()
 				local metCondition = true
 				for idx,set in pairs(event.sets) do
 					local argVal = args[idx]
-					local cmdSet = cmd[2][idx]
+					local cmdSet = type(cmd[2]) == "table" and cmd[2][idx] or 0
 					local condType = set.Type
 					if condType == "Player" then
 						if cmdSet == 0 then
@@ -2271,26 +2367,33 @@ eventEditor = (function()
 						end
 					elseif condType == "String" then
 						if cmdSet ~= 0 then
-							metCondition = metCondition and string.find(argVal:lower(),cmdSet:lower())
+							metCondition = metCondition and string.find(tostring(argVal or ""):lower(), tostring(cmdSet):lower(), 1, true) ~= nil
 						end
 					elseif condType == "Number" then
 						if cmdSet ~= 0 then
-							metCondition = metCondition and tonumber(argVal)<=tonumber(cmdSet)
+							local numberValue, ceiling = tonumber(argVal), tonumber(cmdSet)
+                            metCondition = metCondition and numberValue ~= nil and ceiling ~= nil and numberValue <= ceiling
 						end
 					end
 					if not metCondition then break end
 				end
 
 				if metCondition then
-					pcall(task.spawn(function()
-						local cmdStr = cmd[1]
-						for count,arg in pairs(args) do
-							cmdStr = cmdStr:gsub("%$"..count,arg)
-						end
-						if cmdStr:lower():match("plugin") then return end
-						wait(cmd[3] or 0)
-						execCmd(cmdStr)
-					end))
+                    task.spawn(function()
+                        local ok, err = pcall(function()
+                            local cmdStr = tostring(cmd[1] or "")
+                            for count, arg in pairs(args) do
+                                -- Function replacements keep percent signs literal.
+                                cmdStr = cmdStr:gsub("%$" .. count, function() return tostring(arg) end)
+                            end
+                            if cmdStr:lower():find("plugin", 1, true) then return end
+                            task.wait(math.max(0, tonumber(cmd[3]) or 0))
+                            execCmd(cmdStr)
+                        end)
+                        if not ok then
+                            warn("[Infinite Yield] Event command failed: " .. tostring(err))
+                        end
+                    end)
 				end
 			end
 		end
@@ -2923,6 +3026,67 @@ reference = (function()
 	end)
 end)()
 
+-- IY_SETTINGS_CODEC_MODULE_BEGIN
+-- Validate decoded legacy settings before applying to live global state.
+-- Data keys, disk format and existing defaults remain unchanged.
+local IYSettingsCodec = {}
+local function finiteNumber(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+local function validColor(value)
+    if type(value) ~= "table" then return false end
+    for i = 1, 3 do
+        if not finiteNumber(value[i]) or value[i] < 0 or value[i] > 1 then return false end
+    end
+    return true
+end
+local colors = {"currentShade1", "currentShade2", "currentShade3", "currentText1", "currentText2", "currentScroll"}
+local stringKeys = {"prefix", "eventBinds", "logsWebhook"}
+local booleanKeys = {"StayOpen", "keepIY", "logsEnabled", "jLogsEnabled"}
+local tableKeys = {"aliases", "binds", "WayPoints", "PluginsTable", "spawnCmds"}
+
+function IYSettingsCodec.Validate(value, defaults)
+    if type(value) ~= "table" then return nil, "settings root must be a table" end
+    if type(defaults) ~= "table" then return nil, "settings defaults missing" end
+    -- Copy once; preserve unrecognized old keys rather than silently deleting them.
+    local safe = {}
+    for key, item in pairs(value) do safe[key] = item end
+    for _, key in ipairs(colors) do
+        if not validColor(safe[key]) then safe[key] = defaults[key] end
+    end
+    for _, key in ipairs(stringKeys) do
+        if safe[key] ~= nil and type(safe[key]) ~= "string" then safe[key] = defaults[key] end
+    end
+    for _, key in ipairs(booleanKeys) do
+        if safe[key] ~= nil and type(safe[key]) ~= "boolean" then safe[key] = defaults[key] end
+    end
+    for _, key in ipairs(tableKeys) do
+        if safe[key] ~= nil and type(safe[key]) ~= "table" then safe[key] = defaults[key] end
+    end
+    if type(safe.aliases) == "table" then
+        local changed = false
+        for _, entry in ipairs(safe.aliases) do
+            if type(entry) ~= "table" or type(entry.CMD) ~= "string" or type(entry.ALIAS) ~= "string" then
+                changed = true
+                break
+            end
+        end
+        if changed then
+            local valid = {}
+            for _, entry in ipairs(safe.aliases) do
+                if type(entry) == "table" and type(entry.CMD) == "string" and type(entry.ALIAS) == "string" then
+                    valid[#valid + 1] = entry
+                end
+            end
+            safe.aliases = valid
+        end
+    end
+    for _, key in ipairs({"guiScale", "espTransparency"}) do
+        if safe[key] ~= nil and not finiteNumber(safe[key]) then safe[key] = defaults[key] end
+    end
+    return safe
+end
+-- IY_SETTINGS_CODEC_MODULE_END
 currentShade1 = Color3.fromRGB(36, 36, 37)
 currentShade2 = Color3.fromRGB(46, 46, 47)
 currentShade3 = Color3.fromRGB(78, 78, 79)
@@ -3061,7 +3225,9 @@ function saves()
 		if readSuccess then
 			if out ~= nil and tostring(out):gsub("%s", "") ~= "" then
 				local success, response = pcall(function()
-					local json = HttpService:JSONDecode(out)
+                    local raw = HttpService:JSONDecode(out)
+                    local json, validationError = IYSettingsCodec.Validate(raw, defaultsettings)
+                    if not json then error(validationError) end
 					if vtype(json.prefix, "string") then prefix = json.prefix else prefix = ';' end
 					if vtype(json.StayOpen, "boolean") then StayOpen = json.StayOpen else StayOpen = false end
 					if vtype(json.guiScale, "number") then guiScale = json.guiScale else guiScale = defaultGuiScale end
@@ -3152,7 +3318,12 @@ function updatesaves()
 			currentScroll = {currentScroll.R,currentScroll.G,currentScroll.B};
 			eventBinds = eventEditor.SaveData()
 		}
-		writefileCooldown("IY_FE.iy", HttpService:JSONEncode(update))
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(update) end)
+        if ok then
+            writefileCooldown("IY_FE.iy", encoded)
+        else
+            warn("[Infinite Yield] Skipped invalid settings save: " .. tostring(encoded))
+        end
 	end
 end
 
@@ -3234,32 +3405,35 @@ end
 
 -- Basic Infinite Yield notification panel.
 local notificationVersion = 0
+local notificationPinConnection, notificationCloseConnection
 function notify(title, message, length)
     notificationVersion = notificationVersion + 1
     local version = notificationVersion
+    if notificationPinConnection then notificationPinConnection:Disconnect() end
+    if notificationCloseConnection then notificationCloseConnection:Disconnect() end
     Title_2.Text = tostring(message and title or "Notification")
     Text_2.Text = tostring(message or title or "")
     PinImage.ImageTransparency = 0
     local pinned = false
-    local pinConnection, closeConnection
-    pinConnection = PinButton.MouseButton1Click:Connect(function()
+    notificationPinConnection = PinButton.MouseButton1Click:Connect(function()
+        if version ~= notificationVersion then return end
         pinned = not pinned
         PinImage.ImageTransparency = pinned and 0.5 or 0
     end)
-    closeConnection = CloseButton.MouseButton1Click:Connect(function()
+    notificationCloseConnection = CloseButton.MouseButton1Click:Connect(function()
         if version == notificationVersion then
             notificationVersion = notificationVersion + 1
-            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", .25, true)
+            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", 0.25, true)
         end
     end)
-    Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, -100), "InOut", "Quart", .25, true)
-    task.spawn(function()
-        task.wait(tonumber(length) or 10)
-        if version == notificationVersion and not pinned then
-            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", .25, true)
+    Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, -100), "InOut", "Quart", 0.25, true)
+    task.delay(math.max(0, tonumber(length) or 10), function()
+        if version ~= notificationVersion then return end
+        if not pinned then
+            Notification:TweenPosition(UDim2.new(1, Notification.Position.X.Offset, 1, 0), "InOut", "Quart", 0.25, true)
         end
-        if pinConnection then pinConnection:Disconnect() end
-        if closeConnection then closeConnection:Disconnect() end
+        if notificationPinConnection then notificationPinConnection:Disconnect() notificationPinConnection = nil end
+        if notificationCloseConnection then notificationCloseConnection:Disconnect() notificationCloseConnection = nil end
     end)
 end
 
@@ -4118,19 +4292,21 @@ end)
 
 local selectionBox = Instance.new("SelectionBox")
 selectionBox.Name = randomString()
-selectionBox.Color3 = Color3.new(255,255,255)
+selectionBox.Color3 = Color3.fromRGB(255, 255, 255)
 selectionBox.Adornee = nil
 selectionBox.Parent = PARENT
 
 local selected = Instance.new("SelectionBox")
 selected.Name = randomString()
-selected.Color3 = Color3.new(0,166,0)
+selected.Color3 = Color3.fromRGB(0, 166, 0)
 selected.Adornee = nil
 selected.Parent = PARENT
 
 local ActivateHighlight = nil
 local ClickSelect = nil
 function selectPart()
+    if ActivateHighlight then ActivateHighlight:Disconnect() ActivateHighlight = nil end
+    if ClickSelect then ClickSelect:Disconnect() ClickSelect = nil end
 	ToPartFrame:TweenPosition(UDim2.new(0.5, -180, 0, 335), "InOut", "Quart", 0.5, true, nil)
 	local function HighlightPart()
 		if selected.Adornee ~= IYMouse.Target then
@@ -4157,9 +4333,11 @@ Exit_4.MouseButton1Click:Connect(function()
 	ToPartFrame:TweenPosition(UDim2.new(0.5, -180, 0, -500), "InOut", "Quart", 0.5, true, nil)
 	if ActivateHighlight then
 		ActivateHighlight:Disconnect()
+        ActivateHighlight = nil
 	end
 	if ClickSelect then
 		ClickSelect:Disconnect()
+        ClickSelect = nil
 	end
 	selectionBox.Adornee = nil
 	selected.Adornee = nil
@@ -4220,99 +4398,94 @@ PrefixBox:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 
 function CamViewport()
-	if workspace.CurrentCamera then
-		return workspace.CurrentCamera.ViewportSize.X
-	end
+    local camera = workspace.CurrentCamera
+    local width = camera and camera.ViewportSize.X
+    return (type(width) == "number" and width > 250) and width or 800
 end
 
 function UpdateToViewport()
-	if Holder.Position.X.Offset < -CamViewport() then
-		Holder:TweenPosition(UDim2.new(1, -CamViewport(), Holder.Position.Y.Scale, Holder.Position.Y.Offset), "InOut", "Quart", 0.04, true, nil)
-		Notification:TweenPosition(UDim2.new(1, -CamViewport() + 250, Notification.Position.Y.Scale, Notification.Position.Y.Offset), "InOut", "Quart", 0.04, true, nil)
-	end
+    local viewportWidth = CamViewport()
+    if Holder.Position.X.Offset < -viewportWidth then
+        Holder:TweenPosition(UDim2.new(1, -viewportWidth, Holder.Position.Y.Scale, Holder.Position.Y.Offset), "InOut", "Quart", 0.04, true)
+        Notification:TweenPosition(UDim2.new(1, -viewportWidth + 250, Notification.Position.Y.Scale, Notification.Position.Y.Offset), "InOut", "Quart", 0.04, true)
+    end
 end
-CameraChanged = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(UpdateToViewport)
 
-function updateCamera(child, parent)
-	if parent ~= workspace then
-		CamMoved:Disconnect()
-		CameraChanged:Disconnect()
-		repeat wait() until workspace.CurrentCamera
-		CameraChanged = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(UpdateToViewport)
-		CamMoved = workspace.CurrentCamera.AncestryChanged:Connect(updateCamera)
-	end
+-- Reattach when Roblox swaps CurrentCamera, instead of waiting in an ancestry loop.
+local cameraSizeConnection
+local function bindCurrentCamera()
+    if cameraSizeConnection then cameraSizeConnection:Disconnect() cameraSizeConnection = nil end
+    local camera = workspace.CurrentCamera
+    if camera then
+        cameraSizeConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(UpdateToViewport)
+        UpdateToViewport()
+    end
 end
-CamMoved = workspace.CurrentCamera.AncestryChanged:Connect(updateCamera)
+bindCurrentCamera()
+CameraChanged = workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCurrentCamera)
+CamMoved = CameraChanged
+function updateCamera()
+    bindCurrentCamera()
+end
 
-function dragMain(dragpoint,gui)
-	task.spawn(function()
-		local dragging
-		local dragInput
-		local dragStart = Vector3.new(0,0,0)
-		local startPos
-		local function update(input)
-			local pos = -250
-			local delta = input.Position - dragStart
-			if startPos.X.Offset + delta.X <= -500 then
-				local Position = UDim2.new(1, -250, Notification.Position.Y.Scale, Notification.Position.Y.Offset)
-				TweenService:Create(Notification, TweenInfo.new(.20), {Position = Position}):Play()
-				pos = 250
-			else
-				local Position = UDim2.new(1, -500, Notification.Position.Y.Scale, Notification.Position.Y.Offset)
-				TweenService:Create(Notification, TweenInfo.new(.20), {Position = Position}):Play()
-				pos = -250
-			end
-			if startPos.X.Offset + delta.X <= -250 and -CamViewport() <= startPos.X.Offset + delta.X then
-				local Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, gui.Position.Y.Scale, gui.Position.Y.Offset)
-				TweenService:Create(gui, TweenInfo.new(.20), {Position = Position}):Play()
-				local Position2 = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X + pos, Notification.Position.Y.Scale, Notification.Position.Y.Offset)
-				TweenService:Create(Notification, TweenInfo.new(.20), {Position = Position2}):Play()
-			elseif startPos.X.Offset + delta.X > -500 then
-				local Position = UDim2.new(1, -250, gui.Position.Y.Scale, gui.Position.Y.Offset)
-				TweenService:Create(gui, TweenInfo.new(.20), {Position = Position}):Play()
-			elseif -CamViewport() > startPos.X.Offset + delta.X then
-				gui:TweenPosition(UDim2.new(1, -CamViewport(), gui.Position.Y.Scale, gui.Position.Y.Offset), "InOut", "Quart", 0.04, true, nil)
-				local Position = UDim2.new(1, -CamViewport(), gui.Position.Y.Scale, gui.Position.Y.Offset)
-				TweenService:Create(gui, TweenInfo.new(.20), {Position = Position}):Play()
-				local Position2 = UDim2.new(1, -CamViewport() + 250, Notification.Position.Y.Scale, Notification.Position.Y.Offset)
-				TweenService:Create(Notification, TweenInfo.new(.20), {Position = Position2}):Play()
-			end
-		end
-		dragpoint.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				dragging = true
-				dragStart = input.Position
-				startPos = gui.Position
-
-				input.Changed:Connect(function()
-					if input.UserInputState == Enum.UserInputState.End then
-						dragging = false
-					end
-				end)
-			end
-		end)
-		dragpoint.InputChanged:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-				dragInput = input
-			end
-		end)
-		UserInputService.InputChanged:Connect(function(input)
-			if input == dragInput and dragging then
-				update(input)
-			end
-		end)
-	end)
+function dragMain(dragpoint, gui)
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    local function update(input)
+        if not dragStart or not startPos then return end
+        local width = CamViewport() or 800
+        local deltaX = input.Position.X - dragStart.X
+        local xOffset = math.clamp(startPos.X.Offset + deltaX, -width, -250)
+        -- Set positions directly during drag; Tween creation every input frame stutters.
+        gui.Position = UDim2.new(startPos.X.Scale, xOffset, startPos.Y.Scale, startPos.Y.Offset)
+        local notificationOffset = xOffset + (xOffset <= -500 and 250 or -250)
+        Notification.Position = UDim2.new(1, notificationOffset, Notification.Position.Y.Scale, Notification.Position.Y.Offset)
+    end
+    dragpoint.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = gui.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    dragpoint.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then update(input) end
+    end)
 end
 
 dragMain(Title,Holder)
 
-Match = function(name,str)
-	str = str:gsub("%W", "%%%1")
-	return name:lower():find(str:lower()) and true
+Match = function(name, str)
+    -- Plain-text search avoids regex escaping and handles punctuation literally.
+    return type(name) == "string" and type(str) == "string"
+        and name:lower():find(str:lower(), 1, true) ~= nil
 end
 
 local canvasPos = Vector2.new(0,0)
 local topCommand = nil
+-- Cache command buttons; plugin additions/removals update the cache automatically.
+local indexedCommandButtons = {}
+for _, button in ipairs(CMDsF:GetChildren()) do
+    if button:IsA("TextButton") then indexedCommandButtons[#indexedCommandButtons + 1] = button end
+end
+CMDsF.ChildAdded:Connect(function(button)
+    if button:IsA("TextButton") then indexedCommandButtons[#indexedCommandButtons + 1] = button end
+end)
+CMDsF.ChildRemoved:Connect(function(button)
+    for i = #indexedCommandButtons, 1, -1 do
+        if indexedCommandButtons[i] == button then
+            table.remove(indexedCommandButtons, i)
+            break
+        end
+    end
+end)
 local function updateCommandCanvasSize(frame)
 	local scale = (Scale and Scale.Scale) or 1
 	if scale <= 0 then scale = 1 end
@@ -4336,25 +4509,13 @@ IndexContents = function(str,bool,cmdbar,Ianim)
 	end
 	if #chunks > 0 then str = chunks[#chunks] end
 	if str:sub(1,1) == "!" then str = str:sub(2) end
-	for i,v in next, frame:GetChildren() do
-		if v:IsA("TextButton") then
-			if bool then
-				if Match(v.Text,str) then
-					indexnum = indexnum + 1
-					v.Visible = true
-					if topCommand == nil then
-						topCommand = v.Text
-					end
-				else
-					v.Visible = false
-				end
-			else
-				v.Visible = true
-				if topCommand == nil then
-					topCommand = v.Text
-				end
-			end
-		end
+	for _, v in ipairs(indexedCommandButtons) do
+        local visible = not bool or Match(v.Text, str)
+        if v.Visible ~= visible then v.Visible = visible end
+        if visible then
+            indexnum = indexnum + 1
+            if topCommand == nil then topCommand = v.Text end
+        end
 	end
 	updateCommandCanvasSize(frame)
 	if not Ianim then
@@ -5072,31 +5233,162 @@ function parseBoolean(raw, default)
     return default or false
 end
 
-function getstring(begin, args)
-    return table.concat(args or cargs, " ", begin)
+-- IY_PARSER_MODULE_BEGIN
+-- Pure command parsing extracted from the monolithic dispatcher.
+-- No additional syntax is introduced; all parsing follows v3 semantics.
+local IYParser = {}
+function IYParser.Split(str, delim)
+    local parts = {}
+    if type(str) ~= "string" then return parts end
+    delim = delim or ","
+    if delim == "" then return {str} end
+    local start = 1
+    while true do
+        local at = string.find(str, delim, start, true)
+        local item = at and string.sub(str, start, at - 1) or string.sub(str, start)
+        if item ~= "" then parts[#parts + 1] = item end
+        if not at then break end
+        start = at + #delim
+    end
+    return parts
 end
-
--- Standard Infinite Yield command registry and dispatcher.
-findCmd = function(name)
-    if type(name) ~= "string" then return nil end
-    local query = name:lower()
-    for _, command in ipairs(cmds) do
-        if command.NAME:lower() == query then return command end
-        for _, alias in ipairs(command.ALIAS or {}) do
-            if alias:lower() == query then return command end
+function IYParser.Parse(segment, lastCommands)
+    local count, interval, repeating = 1, 0, false
+    local prefix, remainder = segment:match("^(%d+)%^(.*)$")
+    if prefix then
+        count = tonumber(prefix) or 1
+        segment = remainder
+        local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
+        if seconds then interval, segment = tonumber(seconds) or 0, rest end
+    elseif segment:sub(1, 4):lower() == "inf^" then
+        repeating = true
+        segment = segment:sub(5)
+        local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
+        if seconds then interval, segment = tonumber(seconds) or 0.1, rest
+        else interval = 0.1 end
+    end
+    if segment:sub(1, 1) == "!" then
+        local shortcut = segment:sub(2):match("^(%S+)")
+        if shortcut then segment = lastCommands[shortcut:lower()] or segment end
+    end
+    local words = {}
+    for word in segment:gmatch("%S+") do words[#words + 1] = word end
+    return {
+        text = segment,
+        count = count,
+        interval = interval,
+        repeating = repeating,
+        words = words,
+        commandName = words[1] and words[1]:lower(),
+    }
+end
+-- IY_PARSER_MODULE_END
+-- IY_REGISTRY_MODULE_BEGIN
+-- Command registration, first-registered alias precedence, and removal.
+-- This module has no GUI or Roblox dependencies and can be unit-tested alone.
+local IYRegistry = {}
+function IYRegistry.New(entries, customAliasProvider)
+    local lookup = {}
+    local self = {}
+    local function indexOne(entry)
+        if type(entry.NAME) == "string" then
+            local name = entry.NAME:lower()
+            if lookup[name] == nil then lookup[name] = entry end
+        end
+        if type(entry.ALIAS) == "table" then
+            for _, alias in ipairs(entry.ALIAS) do
+                if type(alias) == "string" then
+                    local key = alias:lower()
+                    if lookup[key] == nil then lookup[key] = entry end
+                end
+            end
         end
     end
-    if type(customAlias) == "table" then return customAlias[query] end
-    return nil
+    function self:Rebuild()
+        table.clear(lookup)
+        for _, entry in ipairs(entries) do indexOne(entry) end
+    end
+    function self:Resolve(name)
+        if type(name) ~= "string" then return nil end
+        local key = name:lower()
+        local first = lookup[key]
+        if first then return first end
+        local aliases = customAliasProvider()
+        return type(aliases) == "table" and aliases[key] or nil
+    end
+    function self:Add(name, aliases, callback, plugin)
+        local entry = {NAME = name, ALIAS = aliases or {}, FUNC = callback, PLUGIN = plugin}
+        entries[#entries + 1] = entry
+        indexOne(entry)
+        return entry
+    end
+    function self:Remove(name)
+        local entry = self:Resolve(name)
+        if not entry then return end
+        for i = #entries, 1, -1 do
+            if entries[i] == entry then
+                table.remove(entries, i)
+                local aliases = customAliasProvider()
+                if type(aliases) == "table" then
+                    for key, value in pairs(aliases) do
+                        if value == entry then aliases[key] = nil end
+                    end
+                end
+                self:Rebuild()
+                return
+            end
+        end
+    end
+    function self:Override(name, callback)
+        local entry = self:Resolve(name)
+        if entry then entry.FUNC = callback end
+    end
+    return self
+end
+-- IY_REGISTRY_MODULE_END
+-- IY_COMMAND_SCHEDULER_MODULE_BEGIN
+-- Same repeat and cancellation semantics as the classic dispatcher.
+-- Clock-independent cancellation and injectable task implementation for tests.
+local IYCommandScheduler = {}
+function IYCommandScheduler.Start(options)
+    assert(type(options) == 'table' and type(options.spawn) == 'function', 'scheduler options required')
+    options.spawn(function()
+        local runs = 0
+        repeat
+            if options.cancelled() then break end
+            runs = runs + 1
+            local success, result = pcall(options.execute)
+            if not success then
+                options.onError(result)
+                break
+            end
+            options.onResult(result)
+            if options.repeating or runs < options.count then
+                options.wait(math.max(options.interval, 0.01))
+            end
+        until (not options.repeating and runs >= options.count)
+    end)
+end
+-- IY_COMMAND_SCHEDULER_MODULE_END
+local commandArgsByThread = setmetatable({}, {__mode = "k"})
+function getstring(begin, args)
+    local activeArgs = args or commandArgsByThread[coroutine.running()] or cargs
+    if type(activeArgs) ~= "table" then return "" end
+    return table.concat(activeArgs, " ", begin)
 end
 
+-- Registry adapter: preserves legacy findCmd() and rebuildCommandLookup() APIs.
+local iyRegistry = IYRegistry.New(cmds, function() return customAlias end)
+local function rebuildCommandLookup()
+    iyRegistry:Rebuild()
+end
+findCmd = function(name)
+    return iyRegistry:Resolve(name)
+end
+
+-- Legacy public helper retains its original return values.
 function splitString(str, delim)
-    local broken = {}
-    if delim == nil then delim = "," end
-    for item in string.gmatch(str, "[^" .. delim .. "]+") do
-        broken[#broken + 1] = item
-    end
-    return broken
+    return IYParser.Split(str, delim)
 end
 
 cmdHistory = {}
@@ -5114,27 +5406,10 @@ function execCmd(input, speaker, store)
     for _, segment in ipairs(segments) do
         segment = segment:match("^%s*(.-)%s*$")
         if segment ~= "" then
-            local count, interval, repeating = 1, 0, false
-            local prefix, remainder = segment:match("^(%d+)%^(.*)$")
-            if prefix then
-                count = tonumber(prefix) or 1
-                segment = remainder
-                local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
-                if seconds then interval, segment = tonumber(seconds) or 0, rest end
-            elseif segment:sub(1, 4):lower() == "inf^" then
-                repeating = true
-                segment = segment:sub(5)
-                local seconds, rest = segment:match("^([%d%.]+)%^(.*)$")
-                if seconds then interval, segment = tonumber(seconds) or 0.1, rest
-                else interval = 0.1 end
-            end
-            if segment:sub(1, 1) == "!" then
-                local shortcut = segment:sub(2):match("^(%S+)")
-                if shortcut then segment = lastCmds[shortcut:lower()] or segment end
-            end
-            local words = {}
-            for word in segment:gmatch("%S+") do words[#words + 1] = word end
-            local commandName = words[1] and words[1]:lower()
+            local parsed = IYParser.Parse(segment, lastCmds)
+            local count, interval, repeating = parsed.count, parsed.interval, parsed.repeating
+            segment = parsed.text
+            local words, commandName = parsed.words, parsed.commandName
             local command = commandName and findCmd(commandName)
             if command then
                 table.remove(words, 1)
@@ -5146,48 +5421,48 @@ function execCmd(input, speaker, store)
                     lastCmds[commandName] = segment
                 end
                 local epoch = lastBreakTime
-                task.spawn(function()
-                    local runs = 0
-                    repeat
-                        if lastBreakTime ~= epoch then break end
-                        runs = runs + 1
-                        cargs = words -- legacy Infinite Yield commands rely on cargs
-                        local ok, result = pcall(command.FUNC, words, actor)
-                        if not ok then
-                            warn("[Infinite Yield] Command error: " .. tostring(result))
-                            break
-                        end
+                IYCommandScheduler.Start({
+                    spawn = task.spawn,
+                    wait = task.wait,
+                    count = count,
+                    interval = interval,
+                    repeating = repeating,
+                    cancelled = function() return epoch ~= lastBreakTime end,
+                    execute = function()
+                        -- Keep legacy cargs for external plugin compatibility.
+                        cargs = words
+                        local currentThread = coroutine.running()
+                        commandArgsByThread[currentThread] = words
+                        local success, result = pcall(command.FUNC, words, actor)
+                        commandArgsByThread[currentThread] = nil
+                        if not success then error(result, 0) end
+                        return result
+                    end,
+                    onResult = function(result)
                         if type(result) == "string" and not table.find(words, "nonotify") and not repeating then
                             notify("Command: " .. commandName, result)
                         end
-                        if repeating or runs < count then task.wait(math.max(interval, 0.01)) end
-                    until (not repeating and runs >= count)
-                end)
+                    end,
+                    onError = function(message)
+                        warn("[Infinite Yield] Command error: " .. tostring(message))
+                    end,
+                })
             end
         end
     end
 end
 
+-- Public API remains unchanged for the original 435 registrations and plugins.
 function addcmd(name, alias, func, plgn)
-    local command = {NAME = name, ALIAS = alias or {}, FUNC = func, PLUGIN = plgn}
-    cmds[#cmds + 1] = command
-    return command
+    return iyRegistry:Add(name, alias, func, plgn)
 end
 
 function removecmd(name)
-    local command = findCmd(name)
-    if not command then return end
-    for index = #cmds, 1, -1 do
-        if cmds[index] == command then
-            table.remove(cmds, index)
-            break
-        end
-    end
+    return iyRegistry:Remove(name)
 end
 
 function overridecmd(name, callback)
-    local command = findCmd(name)
-    if command then command.FUNC = callback end
+    return iyRegistry:Override(name, callback)
 end
 
 function addbind(cmd,key,iskeyup,toggle)
@@ -5582,7 +5857,8 @@ getprfx=function(strn)
 end
 
 function do_exec(str, plr)
-	str = str:gsub('/e ', '')
+    if type(str) ~= "string" then return end
+    str = str:gsub("^/e%s+", "")
 	local t = getprfx(str)
 	if not t then return end
 	str = str:sub(t[2])
@@ -6125,9 +6401,9 @@ Add_2.MouseButton1Click:Connect(function()
 		if string.find(Cmdbar_2.Text, "\\\\") or string.find(Cmdbar_3.Text, "\\\\") then
 			notify('Keybind Error','Only use one backslash to keybind multiple commands into one keybind or command')
 		else
-			if newToggle and Cmdbar_3.Text ~= '' and Cmdbar_2.text ~= '' then
+			if newToggle and Cmdbar_3.Text ~= '' and Cmdbar_2.Text ~= '' then
 				addbind(Cmdbar_2.Text,keyPressed,false,Cmdbar_3.Text)
-			elseif not newToggle and Cmdbar_2.text ~= '' then
+			elseif not newToggle and Cmdbar_2.Text ~= '' then
 				addbind(Cmdbar_2.Text,keyPressed,bindChosenKeyUp)
 			else
 				return
@@ -6326,11 +6602,18 @@ function deletePlugin(name)
 	if name:sub(-3) == '.iy' then
 		pName = name
 	end
-	for i = #cmds,1,-1 do
-		if cmds[i].PLUGIN == pName then
-			table.remove(cmds, i)
-		end
-	end
+    local removedEntries = {}
+    for i = #cmds, 1, -1 do
+        if cmds[i].PLUGIN == pName then
+            removedEntries[cmds[i]] = true
+            table.remove(cmds, i)
+        end
+    end
+    -- Custom aliases must not resolve to removed plugin command objects.
+    for alias, entry in pairs(customAlias) do
+        if removedEntries[entry] then customAlias[alias] = nil end
+    end
+    rebuildCommandLookup()
 	for i,v in pairs(CMDsF:GetChildren()) do
 		if v.Name == 'PLUGIN_'..pName then
 			v:Destroy()
@@ -6407,47 +6690,50 @@ function LoadPlugin(val,startup)
 
 	xpcall(CatchedPluginLoad, handlePluginError)
 
-	if plugin ~= nil then
-		if not startup then
-			notify('Loaded Plugin',"Name: "..plugin["PluginName"].."\n".."Description: "..plugin["PluginDescription"])
-		end
-		addcmdtext('',val)
-		addcmdtext(string.upper('--'..plugin["PluginName"]),val,plugin["PluginDescription"])
-		if plugin["Commands"] then
-			for i,v in pairs(plugin["Commands"]) do 
-				local cmdExt = ''
-				local cmdName = i
-				local function handleNames()
-					cmdName = i
-					if findCmd(cmdName..cmdExt) then
-						if isNumber(cmdExt) then
-							cmdExt = cmdExt+1
-						else
-							cmdExt = 1
-						end
-						handleNames()
-					else
-						cmdName = cmdName..cmdExt
-					end
-				end
-				handleNames()
-				addcmd(cmdName, v["Aliases"], v["Function"], val)
-				if v["ListName"] then
-					local newName = v.ListName
-					local cmdNames = {i,unpack(v.Aliases)}
-					for i,v in pairs(cmdNames) do
-						newName = newName:gsub(v,v..cmdExt)
-					end
-					addcmdtext(newName,val,v["Description"])
-				else
-					addcmdtext(cmdName,val,v["Description"])
-				end
-			end
-		end
-		IndexContents('',true)
-	elseif plugin == nil then
-		plugin = nil
-	end
+    if plugin ~= nil and type(plugin) ~= "table" then
+        warn("[Infinite Yield] Invalid plugin metadata in " .. tostring(val))
+        plugin = nil
+    end
+    if plugin ~= nil then
+        local pluginName = type(plugin.PluginName) == "string" and plugin.PluginName or tostring(val)
+        local description = type(plugin.PluginDescription) == "string" and plugin.PluginDescription or ""
+        if not startup then
+            notify('Loaded Plugin', "Name: " .. pluginName .. "\nDescription: " .. description)
+        end
+        addcmdtext('', val)
+        addcmdtext(string.upper('--' .. pluginName), val, description)
+        if type(plugin.Commands) == "table" then
+            for originalName, definition in pairs(plugin.Commands) do
+                if type(originalName) == "string" and type(definition) == "table"
+                    and type(definition.Function) == "function" then
+                    local aliases = type(definition.Aliases) == "table" and definition.Aliases or {}
+                    local suffix = ''
+                    while findCmd(originalName .. tostring(suffix)) do
+                        suffix = (suffix == '' and 1) or (suffix + 1)
+                    end
+                    local commandName = originalName .. tostring(suffix)
+                    addcmd(commandName, aliases, definition.Function, val)
+                    if type(definition.ListName) == "string" then
+                        local label = definition.ListName
+                        local labels = {originalName}
+                        for _, alias in ipairs(aliases) do labels[#labels + 1] = alias end
+                        for _, token in ipairs(labels) do
+                            if type(token) == "string" then
+                                local escaped = token:gsub('([^%w])', '%%%1')
+                                label = label:gsub(escaped, function() return token .. tostring(suffix) end)
+                            end
+                        end
+                        addcmdtext(label, val, definition.Description)
+                    else
+                        addcmdtext(commandName, val, definition.Description)
+                    end
+                else
+                    warn("[Infinite Yield] Ignoring invalid plugin command entry in " .. tostring(val))
+                end
+            end
+        end
+        IndexContents('', true)
+    end
 end
 
 function FindPlugins()
@@ -6926,7 +7212,7 @@ addcmd('notifyjobid',{},function(args, speaker)
 end)
 
 addcmd('breakloops',{'break'},function(args, speaker)
-	lastBreakTime = tick()
+	lastBreakTime = lastBreakTime + 1 -- Monotonic epoch: repeated break commands always cancel pending jobs
 end)
 
 addcmd('gametp',{'gameteleport'},function(args, speaker)
@@ -13767,8 +14053,8 @@ updateColors(currentText1,text1)
 updateColors(currentText2,text2)
 updateColors(currentScroll,scroll)
 
-if PluginsTable ~= nil or PluginsTable ~= {} then
-	FindPlugins(PluginsTable)
+if type(PluginsTable) == "table" then
+    FindPlugins(PluginsTable)
 end
 
 -- Events
@@ -13902,14 +14188,15 @@ end
 
 IYMouse.Move:Connect(checkTT)
 
-CaptureService.CaptureBegan:Connect(function()
-	PARENT.Enabled = false
-end)
-
-CaptureService.CaptureEnded:Connect(function()
-	task.delay(0.1, function()
-		PARENT.Enabled = true
-	end)
+pcall(function()
+    CaptureService.CaptureBegan:Connect(function()
+        if PARENT then PARENT.Enabled = false end
+    end)
+    CaptureService.CaptureEnded:Connect(function()
+        task.delay(0.1, function()
+            if PARENT then PARENT.Enabled = true end
+        end)
+    end)
 end)
 
 task.spawn(function()
