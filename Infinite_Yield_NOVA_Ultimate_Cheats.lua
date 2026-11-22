@@ -10863,9 +10863,180 @@ addcmd('oldconsole',{},function(args, speaker)
 	notify('Console','Press F9 to open the console')
 end)
 
+-- NOVA Dex++ right-click remote repeater: optional arguments per remote and per-remote stop.
+-- This patches Dex++'s real Explorer context menu before loading it, without modifying
+-- its upstream scripts or intercepting unrelated game traffic.
+local NOVA_DEX_URL = "https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua"
+local NOVA_DEX_MENU_MARKER = 'if presentClasses["RemoteEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end'
+local NOVA_DEX_REG_MARKER = 'Explorer.RightClickContext = context'
+
+local NOVA_DEX_MENU_INSERT = [==[
+		-- NOVA: show actions only for one selected client-to-server remote.
+		if #sList == 1 and (presentClasses["RemoteEvent"] or presentClasses["RemoteFunction"] or presentClasses["UnreliableRemoteEvent"]) then
+			context:AddRegistered("NOVA_REPEAT_START")
+			context:AddRegistered("NOVA_REPEAT_STOP")
+		end
+
+]==]
+
+local NOVA_DEX_REG_INSERT = [==[
+		-- NOVA remote repeater. Keep its state across Dex windows and repeated loads.
+		local novaGlobal = (type(getgenv) == "function" and getgenv()) or _G
+		local novaState = novaGlobal.NOVA_DexRemoteRepeater
+		if type(novaState) ~= "table" then
+			novaState = {
+				loops = setmetatable({}, {__mode = "k"}),
+				args = setmetatable({}, {__mode = "k"}),
+			}
+			novaGlobal.NOVA_DexRemoteRepeater = novaState
+		end
+		novaState.loops = novaState.loops or setmetatable({}, {__mode = "k"})
+		novaState.args = novaState.args or setmetatable({}, {__mode = "k"})
+
+		local function novaSelectedRemote()
+			local entries = selection.List
+			if #entries ~= 1 then return nil end
+			local remote = entries[1].Obj
+			if not remote then return nil end
+			if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent") then
+				return remote
+			end
+			return nil
+		end
+
+		local function novaNotice(message)
+			pcall(function()
+				game:GetService("StarterGui"):SetCore("SendNotification", {
+					Title = "NOVA Dex++",
+					Text = message,
+					Duration = 4,
+				})
+			end)
+		end
+
+		context:Register("NOVA_REPEAT_START", {
+			Name = "NOVA: Start Auto Fire (0.01s)",
+			IconMap = Explorer.MiscIcons,
+			Icon = "Play",
+			OnClick = function()
+				local remote = novaSelectedRemote()
+				if not remote then return end
+				local existing = novaState.loops[remote]
+				if existing and existing.running then
+					novaNotice("Already running: " .. remote.Name)
+					return
+				end
+				local job = {running = true, sent = 0, errors = 0}
+				novaState.loops[remote] = job
+				novaNotice("Started: " .. remote.Name .. " (0.01s)")
+
+				task.spawn(function()
+					local isFunction = remote:IsA("RemoteFunction")
+					while job.running and remote.Parent ~= nil do
+						-- Default to no arguments. For remotes expecting args, set
+						-- getgenv().NOVA_DexRemoteRepeater.args[remote] = table.pack(...)
+						local savedArgs = novaState.args[remote]
+						local params = type(savedArgs) == "table" and savedArgs or {}
+						local count = type(params.n) == "number" and params.n or #params
+						local ok, err = pcall(function()
+							if isFunction then
+								remote:InvokeServer(table.unpack(params, 1, count))
+							else
+								remote:FireServer(table.unpack(params, 1, count))
+							end
+						end)
+						if ok then
+							job.sent = job.sent + 1
+							job.errors = 0
+						else
+							job.errors = job.errors + 1
+							if job.errors >= 3 then
+								warn("[NOVA Dex] Repeater stopped for " .. remote.Name .. ": " .. tostring(err))
+								novaNotice("Stopped after errors: " .. remote.Name)
+								break
+							end
+						end
+						-- Requested minimum interval; frame rate/network/server may limit rate.
+						task.wait(0.01)
+					end
+					job.running = false
+					if novaState.loops[remote] == job then
+						novaState.loops[remote] = nil
+					end
+				end)
+			end,
+		})
+
+		context:Register("NOVA_REPEAT_STOP", {
+			Name = "NOVA: Stop Auto Fire",
+			IconMap = Explorer.MiscIcons,
+			Icon = "Pause",
+			OnClick = function()
+				local remote = novaSelectedRemote()
+				if not remote then return end
+				local job = novaState.loops[remote]
+				if job and job.running then
+					job.running = false
+					novaNotice("Stopping: " .. remote.Name)
+				else
+					novaNotice("Not running: " .. remote.Name)
+				end
+			end,
+		})
+
+]==]
+
+local function novaDexInsertBefore(sourceText, marker, injection)
+    local at = string.find(sourceText, marker, 1, true)
+    if not at then return nil end
+    return string.sub(sourceText, 1, at - 1) .. injection .. string.sub(sourceText, at)
+end
+
+local function novaPatchDex(sourceText)
+    if type(sourceText) ~= "string" or #sourceText < 1000 then
+        return nil, "Dex++ download was empty or invalid"
+    end
+    if string.find(sourceText, "NOVA_REPEAT_START", 1, true) then
+        return sourceText -- Already patched.
+    end
+    local patched = novaDexInsertBefore(sourceText, NOVA_DEX_MENU_MARKER, NOVA_DEX_MENU_INSERT)
+    if not patched then
+        return nil, "Dex++ Explorer menu layout has changed"
+    end
+    patched = novaDexInsertBefore(patched, NOVA_DEX_REG_MARKER, NOVA_DEX_REG_INSERT)
+    if not patched then
+        return nil, "Dex++ Explorer registration layout has changed"
+    end
+    return patched
+end
+
 addcmd("explorer", {"dex"}, function(args, speaker)
-    notify("Loading", "Hold on a sec")
-    loadstring(game:HttpGet("https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua"))()
+    notify("Loading", "Loading Dex++ with NOVA remote actions")
+    local downloaded, sourceOrError = pcall(function()
+        return game:HttpGet(NOVA_DEX_URL)
+    end)
+    if not downloaded then
+        warn("[NOVA Dex] Download failed: " .. tostring(sourceOrError))
+        notify("Dex++", "Download failed; check console")
+        return
+    end
+    local patched, patchError = novaPatchDex(sourceOrError)
+    if not patched then
+        warn("[NOVA Dex] " .. tostring(patchError))
+        notify("Dex++", "Patch incompatible with this Dex++ version")
+        return
+    end
+    local compiled, syntaxError = loadstring(patched)
+    if type(compiled) ~= "function" then
+        warn("[NOVA Dex] Compilation failed: " .. tostring(syntaxError))
+        notify("Dex++", "Failed to compile patched Dex++")
+        return
+    end
+    local launched, runtimeError = pcall(compiled)
+    if not launched then
+        warn("[NOVA Dex] Launch error: " .. tostring(runtimeError))
+        notify("Dex++", "Launch failed; check console")
+    end
 end)
 
 addcmd("moondex", {"mdex"}, function(args, speaker)
